@@ -389,16 +389,16 @@ with col1:
 with col2:
     st.header("④ AI 통합 검토 결과")
     if st.button("AI 검토 실행"):
-    if not api_key:
-        st.error("OpenAI API Key를 입력하세요.")
-    else:
-        doc_json = st.session_state.get("doc_json")   # 세션에서 안전하게 꺼냄
-        if not doc_json:
-            st.error("먼저 문서를 업로드해 주세요.")
+        if not api_key:
+            st.error("OpenAI API Key를 입력하세요.")
         else:
-            with st.spinner("AI가 문서를 검토 중..."):
-                result = integrated_compare(api_key, doc_json, model="gpt-4o")
-            st.session_state["analysis_result"] = result
-            st.success("검토 완료 ✅")
-            st.write(result)
-    
+            doc_json = st.session_state.get("doc_json")   # 세션에서 안전하게 꺼냄
+            if not doc_json:
+                st.error("먼저 문서를 업로드해 주세요.")
+            else:
+                with st.spinner("AI가 문서를 검토 중..."):
+                    result = integrated_compare(api_key, doc_json, model="gpt-4o")
+                st.session_state["analysis_result"] = result
+                st.success("검토 완료 ✅")
+                st.write(result)
+        
