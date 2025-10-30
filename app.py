@@ -368,28 +368,37 @@ with col1:
             else:
                 st.info("업로드된 PASS/FAIL 이미지가 없습니다.")
 
-    st.header("③ 테스트 결재 문서 업로드")
-    test_img = st.file_uploader("테스트 문서", type=["jpg", "png", "jpeg"], key="test_img")
+    st.header("① 결재 문서 업로드")
+    test_img = st.file_uploader("검토할 문서 (jpg/png)", type=["jpg", "png", "jpeg"])
+
     if test_img and api_key:
+    # 이미지 열기
         img = Image.open(test_img).convert("RGB")
-        st.image(img, caption="테스트 문서", use_container_width=True)
+        st.image(img, caption="업로드 문서", use_container_width=True)
+
+    # Vision 호출로 JSON 추출
         with st.spinner("문서 인식 중..."):
-            test_json = gpt_extract_table(api_key, img, model)
-        test_json = normalize_keys(test_json)  # 일관화
-        st.session_state["test_json"] = test_json
+            doc_json = gpt_extract_table(api_key, img, model="gpt-4o")  # ← 여기서 doc_json 생성
+
         st.success("문서 인식 완료 ✅")
+
+    # UI에 JSON은 보여주지 않고 세션에만 저장
         st.session_state["doc_json"] = doc_json
 
 # ---------------- 오른쪽: 결과 ----------------
 with col2:
     st.header("④ AI 통합 검토 결과")
     if st.button("AI 검토 실행"):
-        doc_json = st.session_state.get("doc_json")  # 세션에서 읽음
+    if not api_key:
+        st.error("OpenAI API Key를 입력하세요.")
+    else:
+        doc_json = st.session_state.get("doc_json")   # 세션에서 안전하게 꺼냄
         if not doc_json:
             st.error("먼저 문서를 업로드해 주세요.")
         else:
             with st.spinner("AI가 문서를 검토 중..."):
-                result = integrated_compare(api_key, doc_json, model)
+                result = integrated_compare(api_key, doc_json, model="gpt-4o")
+            st.session_state["analysis_result"] = result
             st.success("검토 완료 ✅")
             st.write(result)
     
