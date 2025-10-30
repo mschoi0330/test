@@ -295,7 +295,7 @@ with col1:
 
         # 인식 결과 표시
         if "doc_json" in st.session_state:
-
+            pass
 # ------------ 오른쪽: 비교 ------------
 with col2:
     st.subheader("④ 가이드라인 + 유의사항과 비교")
