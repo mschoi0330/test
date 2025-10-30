@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+
+# App data
+chroma_db/*
+!chroma_db/.gitkeep
+
+# Secrets
+.env

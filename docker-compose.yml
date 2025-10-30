@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  ai-approval:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./chroma_db:/app/chroma_db
+    restart: unless-stopped
