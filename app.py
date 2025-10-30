@@ -5,9 +5,11 @@ import base64
 import json
 import hashlib
 import re
+import glob
+from datetime import datetime
 from typing import List, Dict, Any
 
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance
 from openai import OpenAI
 from pypdf import PdfReader
 import chromadb
@@ -19,8 +21,21 @@ APP_TITLE = "📄 AI 결재 사전검토"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
+# -------------------- 경로/폴더 --------------------
+APP_ROOT = os.getcwd()
+DB_DIR = os.path.join(APP_ROOT, "chroma_db")
+DATA_DIR = os.path.join(APP_ROOT, "data")
+PASS_DIR = os.path.join(DATA_DIR, "pass_json")
+FAIL_DIR = os.path.join(DATA_DIR, "fail_json")
+
+def ensure_dirs():
+    os.makedirs(DB_DIR, exist_ok=True)
+    os.makedirs(PASS_DIR, exist_ok=True)
+    os.makedirs(FAIL_DIR, exist_ok=True)
+
+ensure_dirs()
+
 # -------------------- Chroma 초기화 --------------------
-DB_DIR = "./chroma_db"
 chroma_client = chromadb.PersistentClient(path=DB_DIR)
 GUIDE_COLLECTION_NAME = "company_guideline"
 
@@ -275,6 +290,72 @@ def gpt_extract_table(api_key: str, pil_img: Image.Image, model: str = "gpt-4o")
     return merged
 
 
+# -------------------- 레퍼런스 통계 --------------------
+def load_reference_stats(pass_dir=PASS_DIR, fail_dir=FAIL_DIR):
+    def _load_all(p):
+        out = []
+        for f in glob.glob(os.path.join(p, "*.json")):
+            try:
+                out.append(json.load(open(f, "r", encoding="utf-8")))
+            except Exception:
+                pass
+        return out
+
+    pass_docs = _load_all(pass_dir)
+    fail_docs = _load_all(fail_dir)
+
+    filled_ratio = {}
+    if pass_docs:
+        keys = set().union(*[d.keys() for d in pass_docs])
+        for k in keys:
+            vals = [(str(d.get(k, "")).strip() != "") for d in pass_docs]
+            if vals:
+                filled_ratio[k] = sum(vals) / len(vals)
+
+    # 사실상 필수(예: 0.8 이상)
+    inferred_required = {k for k, r in filled_ratio.items() if r >= 0.8}
+
+    # FAIL에서 자주 비는 필드 (상위 5)
+    fail_empty_rank = []
+    if fail_docs:
+        from collections import Counter
+        cnt = Counter()
+        for d in fail_docs:
+            for k, v in d.items():
+                if str(v).strip() == "":
+                    cnt[k] += 1
+        fail_empty_rank = cnt.most_common(5)
+
+    return {
+        "pass_docs": pass_docs,
+        "fail_docs": fail_docs,
+        "filled_ratio": filled_ratio,
+        "inferred_required": inferred_required,
+        "fail_empty_rank": fail_empty_rank,
+        "pass_count": len(pass_docs),
+        "fail_count": len(fail_docs),
+    }
+
+
+def compare_with_reference(doc_json: Dict[str, Any], ref_stats: Dict[str, Any]):
+    issues = []
+    req = ref_stats.get("inferred_required", set())
+
+    for k in sorted(req):
+        if str(doc_json.get(k, "")).strip() == "":
+            issues.append({"항목명": k, "문제점": "레퍼런스 기준 필수값 누락", "수정 예시": f"{k} 값을 기입하세요."})
+
+    # 간단한 금액/형식 검증(보정된 스키마와 일치하지 않으면 지적)
+    money_keys = ["업무추진비", "결의금액", "공급가액", "부가세", "합계"]
+    for k in money_keys:
+        v = str(doc_json.get(k, "")).strip()
+        if v and not re.fullmatch(r"^\d{1,3}(,\d{3})*$", v):
+            issues.append({"항목명": k, "문제점": "금액 형식 불일치(예: 150,000)", "수정 예시": "숫자/콤마만 사용"})
+
+    common_empty = [k for k, _ in ref_stats.get("fail_empty_rank", [])]
+    return issues, common_empty
+
+
 # -------------------- LLM 비교 (전체 출력 버전) --------------------
 def compare_doc_with_guideline(
     api_key: str,
@@ -327,6 +408,16 @@ with st.sidebar:
         value=os.environ.get("OPENAI_API_KEY", ""),
     )
     model = st.selectbox("GPT Vision / LLM 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
+    st.markdown("---")
+    if st.button("레퍼런스 통계 로드 / 갱신"):
+        st.session_state["ref_stats"] = load_reference_stats()
+        rs = st.session_state["ref_stats"]
+        st.success(
+            f"레퍼런스 갱신 완료 ✅  (PASS: {rs['pass_count']}개, FAIL: {rs['fail_count']}개, "
+            f"추론된 필수 필드: {len(rs['inferred_required'])}개)"
+        )
+        if rs["fail_empty_rank"]:
+            st.caption("과거 FAIL에서 자주 비던 필드(상위): " + ", ".join([k for k,_ in rs["fail_empty_rank"]]))
 
 col1, col2 = st.columns([1.1, 0.9])
 
@@ -364,7 +455,8 @@ with col1:
         img_bytes = img_file.getvalue()
         img_hash = hashlib.md5(img_bytes).hexdigest()
 
-        st.image(Image.open(io.BytesIO(img_bytes)), caption="업로드한 결재 문서", use_container_width=True)
+        preview = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        st.image(preview, caption="업로드한 결재 문서", use_container_width=True)
 
         need_run = st.session_state.get("last_img_hash") != img_hash or "doc_json" not in st.session_state
 
@@ -372,15 +464,33 @@ with col1:
             st.warning("API Key가 필요합니다. 사이드바에 입력해 주세요.")
         elif need_run:
             with st.spinner("GPT가 문서 인식 중..."):
-                doc_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                doc_json = gpt_extract_table(api_key, doc_img, model=model)
+                doc_json = gpt_extract_table(api_key, preview, model=model)
             st.session_state["doc_json"] = doc_json
             st.session_state["last_img_hash"] = img_hash
             st.success("문서 인식 완료 ✅")
 
-        # 결과 JSON은 표시하지 않음 (요청 사항)
+        # 저장 버튼 (PASS / FAIL)
+        c1, c2 = st.columns(2)
         if "doc_json" in st.session_state:
-            pass  # 화면 출력 생략
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with c1:
+                if st.button("현재 인식 결과를 PASS 샘플로 저장"):
+                    ensure_dirs()
+                    path = os.path.join(PASS_DIR, f"pass_{ts}.json")
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
+                    st.success(f"PASS 샘플 저장 완료: {path}")
+            with c2:
+                if st.button("현재 인식 결과를 FAIL 샘플로 저장"):
+                    ensure_dirs()
+                    path = os.path.join(FAIL_DIR, f"fail_{ts}.json")
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
+                    st.success(f"FAIL 샘플 저장 완료: {path}")
+
+        # 결과 JSON은 화면에 표시하지 않음
+        if "doc_json" in st.session_state:
+            pass
 
 # ------------ 오른쪽: 비교 ------------
 with col2:
@@ -429,6 +539,18 @@ with col2:
                     st.success("검토 완료 ✅")
                     st.markdown("**검토 결과**")
                     st.write(answer)
+
+                    # 레퍼런스 기반 추가 점검
+                    ref_stats = st.session_state.get("ref_stats")
+                    if ref_stats:
+                        add_issues, common_empty = compare_with_reference(doc_json, ref_stats)
+                        if add_issues or common_empty:
+                            st.markdown("---")
+                            st.markdown("**레퍼런스 기반 추가 점검**")
+                            for it in add_issues:
+                                st.write(f"- 항목명: {it['항목명']}\n  - 문제점: {it['문제점']}\n  - 수정 예시: {it['수정 예시']}")
+                            if common_empty:
+                                st.caption("과거 FAIL에서 자주 비던 필드(참고): " + ", ".join(common_empty))
 
                     payload = {
                         "doc_json": doc_json,
