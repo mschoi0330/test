@@ -15,7 +15,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 # ==============================
 # 설정
 # ==============================
-APP_TITLE = "📄 AI 결재 사전검토 (RAG + PASS/FAIL 학습 통합형)"
+APP_TITLE = "📄 AI 결재 사전검토"
 DB_DIR = "./chroma_db"
 DATASET_PATH = "./pass_fail_dataset.json"
 GUIDE_COLLECTION_NAME = "company_guideline"
