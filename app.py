@@ -261,9 +261,9 @@ def integrated_compare(api_key: str, test_json: Dict[str, Any], model: str = "gp
     else:
         dataset = []
 
-    # 로컬 룰: 필수 항목/첨부 누락 우선
+    # 로컬 룰: 필수 항목/첨부 누락 전부 기록
     local_fail_reasons = []
-    required_keys = ["제목", "증빙유형", "지급요청일"]
+    required_keys = ["제목", "증빙유형", "지급요청일", "attachment_count"]
     for k in required_keys:
         if is_empty(test_json.get(k)):
             local_fail_reasons.append(f"필수 항목 '{k}'이(가) 비어 있음")
@@ -276,9 +276,13 @@ def integrated_compare(api_key: str, test_json: Dict[str, Any], model: str = "gp
     prompt = f"""
 너는 회사 결재 문서를 사전 검토하는 AI다.
 
+반드시 아래 조건을 지켜라:
+- 문서의 모든 항목을 끝까지 검토하라. 하나의 FAIL 사유를 발견해도 멈추지 말고, **모든 문제를 전부 나열**해야 한다.
+- 각 문제는 개별 항목별로 구체적인 이유와 수정 예시를 포함하라.
+
 판정 우선순위:
-A. 아래 '로컬 규칙'에서 FAIL 사유가 있으면 반드시 FAIL로 간주하고 사유를 맨 위에 명시한다.
-B. 그 외는 [회사 가이드라인/유의사항]과 [유사 PASS/FAIL 예시]를 참고하여 보수적으로 판단한다.
+A. 아래 '로컬 규칙'에서 FAIL 사유가 있으면 반드시 FAIL로 간주하고, 모든 항목에 대한 문제점을 나열한다.
+B. 그 외 항목도 PASS/FAIL 예시 및 가이드라인을 참고하여 추가적인 누락·오류가 있으면 함께 제시한다.
 
 [로컬 규칙에서 감지된 FAIL 사유]
 {json.dumps(local_fail_reasons, ensure_ascii=False, indent=2)}
@@ -296,13 +300,12 @@ B. 그 외는 [회사 가이드라인/유의사항]과 [유사 PASS/FAIL 예시]
 {json.dumps(test_json, ensure_ascii=False, indent=2)}
 
 요구사항:
-1) 발견된 문제를 아래 포맷으로 나열한다.
+1) 모든 항목을 끝까지 검토하여 문제를 빠짐없이 나열한다.
+2) 출력은 아래 형식으로만 써라.
 - 항목명: ...
 - 문제점: ...
 - 수정 예시: ...
-
-2) 맨 마지막 줄에 '최종 판정: PASS' 또는 '최종 판정: FAIL (이유 ...)' 형태로 출력한다.
-3) 불필요한 서론은 쓰지 말고 형식만 지켜라.
+3) 맨 마지막 줄에 '최종 판정: PASS' 또는 '최종 판정: FAIL (이유 ...)' 형태로 작성한다.
 """
     res = llm.invoke(prompt)
     return res.content if hasattr(res, "content") else str(res)
