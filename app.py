@@ -80,17 +80,7 @@ def split_text(text: str, chunk_size: int = 1500, overlap: int = 100) -> List[st
         if start >= L: break
     return chunks
 
-def embed_texts(texts: List[str], api_key: str) -> List[List[float]]:
-    """OpenAI 임베딩 모델을 사용하여 텍스트 임베딩 생성 (모델: text-embedding-3-small)"""
-    if not texts:
-        return []
-    try:
-        # 모델을 text-embedding-3-small로 변경하여 속도 향상
-        embedder = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
-        return embedder.embed_documents(texts)
-    except Exception as e:
-        st.error(f"임베딩 생성 오류: {e}")
-        return []
+# 기존 embed_texts 함수는 제거하고, save_pdf_to_chroma_batched에 통합하여 사용
 
 def pil_to_b64(img: Image.Image) -> str:
     """PIL Image 객체를 base64 인코딩된 문자열로 변환 (GPT Vision API용)"""
@@ -128,7 +118,6 @@ def is_empty(v) -> bool:
         return True
     if isinstance(v, (int, float)):
         # 0.0, 0, -0.0 등은 값이 있는 것으로 간주. 
-        # 금액 0원 결재가 허용되지 않는다면 로컬 규칙에서 따로 처리해야 함.
         return False 
     s = str(v).strip().lower()
     if s in EMPTY_TOKENS:
@@ -139,29 +128,60 @@ def is_empty(v) -> bool:
     return False
 
 # ==============================
-# PDF → Chroma 저장 / 검색
+# PDF → Chroma 저장 / 검색 (배치 처리 적용)
 # ==============================
-def save_pdf_to_chroma(chunks: List[str], embeddings: List[List[float]], source: str):
-    """PDF 텍스트 청크를 ChromaDB에 저장"""
+def save_pdf_to_chroma(chunks: List[str], api_key: str, source: str, batch_size: int = 50):
+    """PDF 텍스트 청크를 ChromaDB에 배치 처리로 저장 (API Timeout 방지)"""
     if not chroma_client:
         st.error("ChromaDB가 초기화되지 않았습니다.")
-        return
+        return False
 
-    if not chunks or not embeddings:
+    if not chunks:
         st.error(f"{source} PDF에서 텍스트를 찾을 수 없습니다.")
-        return
+        return False
     
-    col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
-    
-    # 이전 데이터 삭제 후 저장 (중복 방지)
-    col.delete(where={"source": source}) 
-    
-    base = 10_000 if source == "caution" else 0
-    ids = [f"{source}_{base + i}" for i in range(len(chunks))]
-    metas = [{"source": source, "chunk": i} for i in range(len(chunks))]
-    
-    col.add(ids=ids, documents=chunks, metadatas=metas, embeddings=embeddings)
-    st.success(f"{source} {len(chunks)}개 저장 완료 ✅")
+    try:
+        col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
+        
+        # 이전 데이터 삭제 후 저장 (중복 방지)
+        col.delete(where={"source": source}) 
+        
+        # 임베더 객체 생성 (배치 처리 루프 외부에서 한 번만 생성)
+        embedder = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
+        
+        total_chunks = len(chunks)
+        base = 10_000 if source == "caution" else 0
+        saved_count = 0
+        
+        # 진행 상태 표시기
+        progress_bar = st.progress(0, text=f"**{source}** 총 {total_chunks}개 청크 임베딩 및 저장 중...")
+
+        for i in range(0, total_chunks, batch_size):
+            chunk_batch = chunks[i:i + batch_size]
+            
+            # 1. 임베딩 배치 생성 (API 호출)
+            emb_batch = embedder.embed_documents(chunk_batch)
+
+            # 2. 메타데이터/ID 준비
+            ids_batch = [f"{source}_{base + i + j}" for j in range(len(chunk_batch))]
+            metas_batch = [{"source": source, "chunk": i + j} for j in range(len(chunk_batch))]
+            
+            # 3. ChromaDB에 배치 저장
+            col.add(ids=ids_batch, documents=chunk_batch, metadatas=metas_batch, embeddings=emb_batch)
+            
+            saved_count += len(chunk_batch)
+            
+            # 4. 진행 상태 업데이트
+            progress_bar.progress(saved_count / total_chunks, text=f"**{source}** 임베딩 진행: {saved_count}/{total_chunks} 완료...")
+        
+        progress_bar.empty()
+        st.success(f"**{source}** {total_chunks}개 청크 저장 완료 ✅")
+        return True
+
+    except Exception as e:
+        st.error(f"임베딩/저장 중 치명적인 오류 발생 (API 키, 네트워크, 데이터 문제 확인): {e}")
+        return False
+
 
 def search_guideline(query: str, api_key: str, k: int = 4) -> List[str]:
     """ChromaDB에서 가이드라인 관련 텍스트 검색"""
@@ -438,20 +458,20 @@ with col1:
             st.error("API Key가 필요합니다.")
         else:
             if pdf_file:
-                st.info(f"가이드라인 PDF ({pdf_file.name}) 처리 중...")
+                st.info(f"가이드라인 PDF ({pdf_file.name}) 텍스트 추출 중...")
                 text = pdf_to_text(pdf_file.read())
                 if text.strip():
                     chunks = split_text(text)
-                    embs = embed_texts(chunks, api_key)
-                    save_pdf_to_chroma(chunks, embs, "guideline")
+                    # 배치 처리 함수 호출
+                    save_pdf_to_chroma(chunks, api_key, "guideline")
             
             if caution_pdf:
-                st.info(f"유의사항 PDF ({caution_pdf.name}) 처리 중...")
+                st.info(f"유의사항 PDF ({caution_pdf.name}) 텍스트 추출 중...")
                 text = pdf_to_text(caution_pdf.read())
                 if text.strip():
                     chunks = split_text(text)
-                    embs = embed_texts(chunks, api_key)
-                    save_pdf_to_chroma(chunks, embs, "caution")
+                    # 배치 처리 함수 호출
+                    save_pdf_to_chroma(chunks, api_key, "caution")
 
     st.header("② PASS / FAIL 학습 데이터 업로드 (선택)")
     pass_imgs = st.file_uploader("✅ PASS 문서 (여러장 가능)", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
