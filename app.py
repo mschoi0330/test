@@ -1,12 +1,13 @@
+# app.py — 빈칸 판정 강화(키 정규화/없음 토큰 처리) + 자동 템플릿 + LLM 설명 고정 활성
 import streamlit as st
-import os, io, json, re, glob, hashlib, base64
+import os, io, json, re, glob, hashlib, base64, unicodedata, string
 from datetime import datetime
 from typing import Dict, Any, List
 from PIL import Image, ImageOps, ImageEnhance
 from openai import OpenAI
 
 # ================== 기본 ==================
-APP_TITLE = "📄 결재 서류 사전검토"
+APP_TITLE = "📄 결재 서류 빈칸 점검 (자동판별 + 정규화 강화)"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
@@ -44,12 +45,16 @@ TEMPLATE_REGISTRY: Dict[str, Dict[str, Any]] = {
             "일비(금액)","일비(산식)","일비(비고)",
             "교통비(금액)","교통비(산식)","교통비(비고)"
             ,"총합계","합계"
-            "첨부(건수)","attachment_count","프로젝트코드"        ],
+            "첨부(건수)","attachment_count","프로젝트코드"        
+        ],
         "key_alias": {
             "신청자":"신청인","신청부서(팀)":"신청부서","부서":"신청부서",
             "근무지":"파견근무지","파견지":"파견근무지",
             "일비 금액":"일비(금액)","일비 산식":"일비(산식)","일비 비고":"일비(비고)",
-            "교통비 금액":"교통비(금액)","숙박비 금액":"숙박비(금액)","합계":"총합계",
+            "교통비 금액":"교통비(금액)","교통비 산식":"교통비(산식)","교통비 비고":"교통비(비고)",
+            "합계":"총합계",
+            "프로젝트 명":"프로젝트명","프로젝트 코드":"프로젝트코드","프로젝트코드(선택)":"프로젝트코드",
+            "합계첨부":"합계첨부(건수)","첨부(합계 건수)":"합계첨부(건수)",
             "첨부":"attachment_count","첨부파일수":"attachment_count","증빙개수":"attachment_count",
         },
         "folder": "dispatch_allowance",
@@ -57,10 +62,34 @@ TEMPLATE_REGISTRY: Dict[str, Dict[str, Any]] = {
 }
 DEFAULT_TEMPLATE = "지출결의서"
 
+# ================== 키 정규화 & 빈값 판정 ==================
+def _canon(s: str) -> str:
+    """키 비교용 정규화: 공백/구두점/괄호 제거 + 한글 호환성 정규화 + 소문자화"""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s))
+    drop = set(string.punctuation) | set("·•・‧ㆍ[](){}<>:：／/\\|-—–~_=+")
+    s = "".join(ch for ch in s if ch not in drop and not ch.isspace())
+    return s.lower()
+
+EMPTY_TOKENS = {"", "-", "—", "–", "ㅡ", "없음", "무", "n/a", "na", "null", "none", "미입력", "미기재", "해당없음"}
+
+def is_empty_value(v) -> bool:
+    """숫자 0/0.0은 채움으로 간주(첨부건수 0 등). 토큰/구두점/공백만이면 빈값."""
+    if v is None:
+        return True
+    if isinstance(v, (int, float)):
+        return False
+    s = unicodedata.normalize("NFKC", str(v)).strip()
+    if s.lower() in EMPTY_TOKENS:
+        return True
+    if all((ch in string.punctuation) or ch.isspace() for ch in s):
+        return True
+    return False
+
 # ================== 유틸 ==================
 def pil_to_b64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    buf = io.BytesIO(); img.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
 def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
@@ -76,19 +105,31 @@ def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
     return img.convert("RGB")
 
 def detect_template_by_title(title: str) -> str:
-    if not title:
-        return DEFAULT_TEMPLATE
+    if not title: return DEFAULT_TEMPLATE
     t = title.strip()
     for name in TEMPLATE_REGISTRY.keys():
-        if name in t:
-            return name
-    if any(k in t for k in ["파견", "파견비", "신청서"]):
-        return "파견비신청서"
+        if name in t: return name
+    if any(k in t for k in ["파견", "파견비", "신청서"]): return "파견비신청서"
     return DEFAULT_TEMPLATE
 
 def normalize_keys_template(d: dict, template: str) -> dict:
+    """별칭 매핑 + 정규화 일치로 스키마 키로 흡수"""
     aliases = TEMPLATE_REGISTRY.get(template, {}).get("key_alias", {})
-    return {aliases.get(str(k).strip(), str(k).strip()): v for k, v in d.items()}
+    out = {}
+    # 1) 별칭 직접
+    for k, v in d.items():
+        k1 = str(k).strip()
+        k2 = aliases.get(k1, k1)
+        out[k2] = v
+    # 2) 정규화 일치
+    schema = TEMPLATE_REGISTRY.get(template, {}).get("schema_keys", [])
+    schema_canon = {_canon(sk): sk for sk in schema}
+    current_canon = {_canon(k): k for k in list(out.keys())}
+    for ck, orig_key in list(current_canon.items()):
+        if ck in schema_canon:
+            std_key = schema_canon[ck]
+            out.setdefault(std_key, out.pop(orig_key))
+    return out
 
 def ref_dirs_for_template(template: str):
     base = TEMPLATE_REGISTRY.get(template, {}).get("folder", "default")
@@ -97,7 +138,7 @@ def ref_dirs_for_template(template: str):
     ensure_dir(pass_dir); ensure_dir(fail_dir)
     return pass_dir, fail_dir
 
-# ================== Vision ==================
+# ================== Vision 호출 ==================
 def ask_vision_values(api_key: str, pil_img: Image.Image, model: str, schema_keys: List[str]) -> dict:
     client = OpenAI(api_key=api_key)
     b64 = pil_to_b64(pil_img)
@@ -115,19 +156,25 @@ def ask_vision_values(api_key: str, pil_img: Image.Image, model: str, schema_key
 
 def gpt_extract_table(api_key: str, pil_img: Image.Image, model: str) -> dict:
     img = preprocess_for_ocr(pil_img)
+    # 1) 제목만 빠르게 → 템플릿 추정
     quick = ask_vision_values(api_key, img, model, ["제목"])
     title = (quick.get("제목") or "").strip()
     template = detect_template_by_title(title)
     schema_keys = TEMPLATE_REGISTRY.get(template, TEMPLATE_REGISTRY[DEFAULT_TEMPLATE])["schema_keys"]
+    # 2) 전체 키로 재추출
     d1 = ask_vision_values(api_key, img, model, schema_keys)
     d1 = normalize_keys_template(d1, template)
+    # 3) 첨부 숫자 보정
     if "attachment_count" in d1:
         m = re.search(r"\d+", str(d1["attachment_count"])); d1["attachment_count"] = int(m.group()) if m else 0
+    if "첨부(건수)" in d1 and not d1.get("attachment_count"):
+        m = re.search(r"\d+", str(d1["첨부(건수)"])); d1["attachment_count"] = int(m.group()) if m else 0
+    # 최종
     d1["__template__"] = template
     if "제목" not in d1: d1["제목"] = title
     return d1
 
-# ================== 분석/빈칸 체크 ==================
+# ================== PASS/FAIL 로드(통계는 선택적) ==================
 def load_reference_stats_blank_only_for_template(template: str):
     pass_dir, fail_dir = ref_dirs_for_template(template)
     def _load_all(p):
@@ -141,17 +188,27 @@ def load_reference_stats_blank_only_for_template(template: str):
     cnt = Counter()
     for d in fail_docs:
         for k, v in d.items():
-            if str(v).strip() == "": cnt[k] += 1
+            if is_empty_value(v): cnt[k] += 1
     return {"pass_count": len(pass_docs), "fail_count": len(fail_docs), "fail_empty_rank": cnt.most_common(10)}
 
+# ================== 빈칸 체크 ==================
 def report_blanks_only(doc_json: dict, template: str):
+    """required_fields만 대상으로 빈칸 판정. 값이 있는데 오판되는 것 방지."""
     required = TEMPLATE_REGISTRY.get(template, {}).get("required_fields", [])
+    # 키 정규화 매핑
+    canon_map = {_canon(k): k for k in doc_json.keys()}
     issues = []
     for k in required:
-        if str(doc_json.get(k, "")).strip() == "":
+        target_key = k
+        c = _canon(k)
+        if c in canon_map:
+            target_key = canon_map[c]
+        v = doc_json.get(target_key, "")
+        if is_empty_value(v):
             issues.append({"항목명": k, "문제점": "빈칸", "수정 예시": f"{k} 값을 입력하세요."})
     return issues
 
+# ================== (항상 활성) LLM 권고문 ==================
 def llm_explain_blanks(api_key: str, model: str, blanks: List[dict]) -> str:
     if not blanks: return ""
     client = OpenAI(api_key=api_key)
@@ -164,22 +221,23 @@ def llm_explain_blanks(api_key: str, model: str, blanks: List[dict]) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-# ================== 사이드바 ==================
+# ================== 사이드바(UI 최소화) ==================
 with st.sidebar:
     st.subheader("🔑 OpenAI 설정")
     api_key = st.text_input("OpenAI API Key", type="password", value=os.environ.get("OPENAI_API_KEY", ""))
     model_vision = st.selectbox("Vision 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
     st.markdown("---")
-    st.info("※ 신뢰도 모드 / LLM 설명 생성 / 자동 템플릿 판별이 항상 활성화되어 있습니다.")
+    st.info("※ 신뢰도 모드 / LLM 설명 / 템플릿 자동판별은 항상 활성화되어 있습니다.")
 
-# 항상 활성화된 내부 설정
-confidence_mode = True
+# 항상 활성 내부 설정 (UI 비노출)
+confidence_mode = True      # 현재 버전에선 내부 로직에서 사용하지 않지만 유지
 llm_help_on = True
-model_text = "gpt-4o"
-manual_template = "자동판별"
+model_text = "gpt-4o"       # 설명용 LLM 고정
+manual_template = "자동판별" # 강제 템플릿 선택 비활성
 
 # ================== 본문 ==================
 col1, col2 = st.columns([1.1, 0.9])
+
 with col1:
     st.subheader("① 이미지 업로드")
     img_file = st.file_uploader("결재/신청서 이미지 (jpg/png)", type=["jpg","jpeg","png"], key="doc_img")
@@ -203,18 +261,20 @@ with col1:
             cur_template = st.session_state["doc_json"].get("__template__", DEFAULT_TEMPLATE)
             pass_dir, fail_dir = ref_dirs_for_template(cur_template)
 
-            b1, b2, b3 = st.columns(3)
-            with b1:
+            c1, c2, c3 = st.columns(3)
+            with c1:
                 if st.button("PASS 샘플로 저장"):
                     path = os.path.join(pass_dir, f"pass_{ts}.json")
-                    with open(path, "w", encoding="utf-8") as f: json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
                     st.success(f"[{cur_template}] PASS 저장: {path}")
-            with b2:
+            with c2:
                 if st.button("FAIL 샘플로 저장"):
                     path = os.path.join(fail_dir, f"fail_{ts}.json")
-                    with open(path, "w", encoding="utf-8") as f: json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
                     st.success(f"[{cur_template}] FAIL 저장: {path}")
-            with b3:
+            with c3:
                 if st.button("이 문서 빈칸 확인"):
                     template = st.session_state["doc_json"].get("__template__", DEFAULT_TEMPLATE)
                     ref = load_reference_stats_blank_only_for_template(template)
@@ -226,7 +286,7 @@ with col1:
                         for it in blanks:
                             st.write(f"- **{it['항목명']}** → {it['수정 예시']}")
                         if llm_help_on:
-                            with st.spinner("LLM 설명 생성 중..."):
+                            with st.spinner("LLM 권고문 생성 중..."):
                                 tip = llm_explain_blanks(api_key, model_text, blanks)
                             st.markdown("**💡 LLM 권고문**")
                             st.write(tip)
@@ -240,3 +300,8 @@ with col2:
     st.write(f"- 전체 구조: {', '.join(config.get('schema_keys', []))}")
     ref = load_reference_stats_blank_only_for_template(cur_template)
     st.write(f"- PASS 샘플: {ref['pass_count']}개 / FAIL 샘플: {ref['fail_count']}개")
+
+    # 디버그가 필요할 때만 아래 주석 해제
+    # with st.expander("인식 디버그(JSON 보기)"):
+    #     if "doc_json" in st.session_state:
+    #         st.json(st.session_state["doc_json"])
