@@ -295,8 +295,6 @@ with col1:
 
         # 인식 결과 표시
         if "doc_json" in st.session_state:
-            st.code(json.dumps(st.session_state["doc_json"], ensure_ascii=False, indent=2), language="json")
-            st.info(f"📎 인식된 첨부파일 개수: {st.session_state['doc_json'].get('attachment_count', 0)}")
 
 # ------------ 오른쪽: 비교 ------------
 with col2:
