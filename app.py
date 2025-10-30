@@ -3,6 +3,7 @@ import os
 import io
 import base64
 import json
+import hashlib
 from typing import List, Dict, Any
 from PIL import Image
 from openai import OpenAI
@@ -270,20 +271,32 @@ with col1:
 
     st.subheader("③ 결재/경비 서류 이미지 업로드")
     img_file = st.file_uploader("이미지 (jpg/png)", type=["jpg", "jpeg", "png"], key="doc_img")
-    if img_file is not None:
-        doc_img = Image.open(img_file)
-        st.image(doc_img, caption="업로드한 결재 문서", use_container_width=True)
 
-        if st.button("이미지에서 표/제목/첨부 인식", type="primary"):
-            if not api_key:
-                st.error("API Key가 필요합니다.")
-            else:
-                with st.spinner("GPT가 문서 인식 중..."):
-                    doc_json = gpt_extract_table(api_key, doc_img, model=model)
-                st.session_state["doc_json"] = doc_json
-                st.success("문서 인식 완료 ✅")
-                #st.code(json.dumps(doc_json, ensure_ascii=False, indent=2), language="json")
-                #st.info(f"📎 인식된 첨부파일 개수: {doc_json.get('attachment_count', 0)}")
+    # 업로드 파일이 바뀌면 자동 인식 (버튼 없이)
+    if img_file is not None:
+        img_bytes = img_file.getvalue()
+        img_hash = hashlib.md5(img_bytes).hexdigest()
+
+        # 미리보기
+        st.image(Image.open(io.BytesIO(img_bytes)), caption="업로드한 결재 문서", use_container_width=True)
+
+        # 파일이 새로 올라왔거나 다른 파일이면 자동 인식
+        need_run = st.session_state.get("last_img_hash") != img_hash or "doc_json" not in st.session_state
+
+        if not api_key:
+            st.warning("API Key가 필요합니다. 사이드바에 입력해 주세요.")
+        elif need_run:
+            with st.spinner("GPT가 문서 인식 중..."):
+                doc_img = Image.open(io.BytesIO(img_bytes))
+                doc_json = gpt_extract_table(api_key, doc_img, model=model)
+            st.session_state["doc_json"] = doc_json
+            st.session_state["last_img_hash"] = img_hash
+            st.success("문서 인식 완료 ✅")
+
+        # 인식 결과 표시
+        if "doc_json" in st.session_state:
+            st.code(json.dumps(st.session_state["doc_json"], ensure_ascii=False, indent=2), language="json")
+            st.info(f"📎 인식된 첨부파일 개수: {st.session_state['doc_json'].get('attachment_count', 0)}")
 
 # ------------ 오른쪽: 비교 ------------
 with col2:
