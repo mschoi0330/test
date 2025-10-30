@@ -10,14 +10,10 @@ from pypdf import PdfReader
 import chromadb
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-APP_TITLE = "📄 AI 결재 사전검토 (표 제목 우선 + 첨부 인식 + 전체 위반사항 출력)"
+APP_TITLE = "📄 AI 결재 사전검토"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption(
-    "1) 가이드라인/유의사항 PDF 업로드 → 2) 결재서 이미지 업로드 → 3) GPT가 표/제목/첨부 인식 → "
-    "4) 가이드라인과 비교해서 모든 문제점 출력"
-)
 
 # -------------------- Chroma 초기화 --------------------
 DB_DIR = "./chroma_db"
@@ -57,7 +53,7 @@ def embed_texts(texts: List[str], api_key: str) -> List[List[float]]:
 # -------------------- Chroma 저장 --------------------
 def save_guideline_to_chroma(chunks: List[str], embeddings: List[List[float]]):
     if not chunks or not embeddings:
-        st.error("가이드라인 PDF에서 텍스트를 못 뽑았어요. (스캔PDF일 수 있음)")
+        st.error("가이드라인 PDF에서 텍스트를 못 뽑았어요.")
         return
     col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
     # source 기준으로만 삭제
@@ -176,6 +172,8 @@ def compare_doc_with_guideline(
     - 기타 가이드/유의사항 위반
     을 전부 나열
     """
+    clean_doc_json = {k: v for k, v in doc_json.items() if k != "approval_line_ignored"}
+
     # ❗ 여기서 max_tokens를 크게 줘서 중간에 안 잘리게 한다
     llm = ChatOpenAI(
         model=model,
@@ -207,7 +205,7 @@ def compare_doc_with_guideline(
    - attachment_count가 0인데 문서 내용에 '출장', '법인카드', '개인카드', '경비', '지급요청', '증빙', '영수증' 등이 있는지
    - 가이드라인에서 필수라고 한 필드(예: 지급요청일, 증빙유형, 카드내역 등)가 JSON에서 비어 있는지
 3. 결재선(결재/합의/승인/참조/수신)은 문제로 삼지 마라.
-4. 출력 형식은 아래 형식으로만 써라. 여러 개면 여러 개를 이어서 써라.
+4. 출력 형식은 아래 ���식으로만 써라. 여러 개면 여러 개를 이어서 써라.
 
 - 항목명: ...
 - 문제점: ...
@@ -223,8 +221,9 @@ def compare_doc_with_guideline(
     return res.content if hasattr(res, "content") else str(res)
 
 
+
 # ------------------------------------------------------------------------------
-# 사이드바
+# 8. Streamlit UI 구성
 # ------------------------------------------------------------------------------
 with st.sidebar:
     st.subheader("🔑 OpenAI 설정")
@@ -233,9 +232,9 @@ with st.sidebar:
         type="password",
         value=os.environ.get("OPENAI_API_KEY", ""),
     )
-    model = st.selectbox("GPT 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
-    st.markdown("---")
-    st.info("PDF는 기준 문서(가이드/유의사항)이고, 결재서는 이미지로 올리세요.")
+    model = st.selectbox("GPT Vision / LLM 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
+
+col1, col2 = st.columns([1.1, 0.9])
 
 
 # ------------------------------------------------------------------------------
@@ -273,7 +272,7 @@ with col1:
     img_file = st.file_uploader("이미지 (jpg/png)", type=["jpg", "jpeg", "png"], key="doc_img")
     if img_file is not None:
         doc_img = Image.open(img_file)
-        st.image(doc_img, caption="업로드한 결재 문서", use_column_width=True)
+        st.image(doc_img, caption="업로드한 결재 문서", use_container_width=True)
 
         if st.button("이미지에서 표/제목/첨부 인식", type="primary"):
             if not api_key:
@@ -283,8 +282,8 @@ with col1:
                     doc_json = gpt_extract_table(api_key, doc_img, model=model)
                 st.session_state["doc_json"] = doc_json
                 st.success("문서 인식 완료 ✅")
-                st.code(json.dumps(doc_json, ensure_ascii=False, indent=2), language="json")
-                st.info(f"📎 인식된 첨부파일 개수: {doc_json.get('attachment_count', 0)}")
+                #st.code(json.dumps(doc_json, ensure_ascii=False, indent=2), language="json")
+                #st.info(f"📎 인식된 첨부파일 개수: {doc_json.get('attachment_count', 0)}")
 
 # ------------ 오른쪽: 비교 ------------
 with col2:
