@@ -17,8 +17,10 @@ from langchain_core.messages import SystemMessage, HumanMessage
 # 설정
 # ==============================
 APP_TITLE = "📄 AI 결재 사전검토 (RAG + PASS/FAIL 학습 통합형)"
-DB_DIR = "./chroma_db"
-DATASET_PATH = "./pass_fail_dataset.json"
+# 🚨 클라우드 환경(Streamlit Cloud)에서 파일 시스템 권한 오류(Read-only)를 방지하기 위해
+# 🚨 /tmp 디렉토리를 사용합니다. 이 디렉토리는 쓰기가 가능하지만, 앱 재시작 시 데이터는 초기화됩니다.
+DB_DIR = "/tmp/chroma_db"
+DATASET_PATH = "/tmp/pass_fail_dataset.json" # 데이터셋 파일 경로도 /tmp로 변경
 GUIDE_COLLECTION_NAME = "company_guideline"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -29,9 +31,12 @@ st.title(APP_TITLE)
 # ==============================
 # ChromaDB 클라이언트 초기화
 try:
+    # /tmp 경로에 데이터베이스를 생성 시도
     chroma_client = chromadb.PersistentClient(path=DB_DIR)
 except Exception as e:
-    st.error(f"ChromaDB 초기화 오류: {e}")
+    # 초기화 실패 시 (예: 클라우드 환경의 권한 문제), 클라이언트 비활성화
+    st.error(f"ChromaDB 초기화 오류 (파일 시스템 권한 문제 예상): {e}")
+    st.warning(f"ChromaDB 경로를 '{DB_DIR}'로 변경했습니다. 만약 오류가 지속된다면 임베딩/RAG 기능은 동작하지 않습니다.")
     chroma_client = None
     
 # 세션 상태 초기화
@@ -57,8 +62,8 @@ def pdf_to_text(file: bytes) -> str:
         st.error(f"PDF 읽기 오류: {e}")
         return ""
 
-def split_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
-    """텍스트를 적절한 크기로 분할하여 임베딩 청크로 만듬"""
+def split_text(text: str, chunk_size: int = 1500, overlap: int = 100) -> List[str]:
+    """텍스트를 적절한 크기로 분할하여 임베딩 청크로 만듬 (chunk_size를 1500으로 상향)"""
     text = text.replace("\r", "\n")
     chunks = []
     start = 0
@@ -76,11 +81,12 @@ def split_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
     return chunks
 
 def embed_texts(texts: List[str], api_key: str) -> List[List[float]]:
-    """OpenAI 임베딩 모델을 사용하여 텍스트 임베딩 생성"""
+    """OpenAI 임베딩 모델을 사용하여 텍스트 임베딩 생성 (모델: text-embedding-3-small)"""
     if not texts:
         return []
     try:
-        embedder = OpenAIEmbeddings(model="text-embedding-3-large", api_key=api_key)
+        # 모델을 text-embedding-3-small로 변경하여 속도 향상
+        embedder = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
         return embedder.embed_documents(texts)
     except Exception as e:
         st.error(f"임베딩 생성 오류: {e}")
@@ -164,7 +170,8 @@ def search_guideline(query: str, api_key: str, k: int = 4) -> List[str]:
 
     try:
         col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
-        embedder = OpenAIEmbeddings(model="text-embedding-3-large", api_key=api_key)
+        # 검색 시에도 동일하게 text-embedding-3-small 사용
+        embedder = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key) 
         q_emb = embedder.embed_query(query)
         result = col.query(query_embeddings=[q_emb], n_results=k)
         
@@ -295,15 +302,17 @@ def check_local_rules(test_json: Dict[str, Any]) -> List[str]:
 # ==============================
 def save_pass_fail_data(new_data: List[Dict[str, Any]]):
     """학습 데이터를 JSON 파일에 저장 (중복 방지 및 메타데이터 추가)"""
-    if os.path.exists(DATASET_PATH):
-        with open(DATASET_PATH, "r", encoding="utf-8") as f:
-            try:
-                existing = json.load(f)
-            except json.JSONDecodeError:
-                 existing = []
-                 st.warning(f"기존 {DATASET_PATH} 파일이 손상되어 초기화합니다.")
-    else:
-        existing = []
+    # /tmp 경로에 파일이 존재하지 않으면 빈 파일 생성
+    if not os.path.exists(DATASET_PATH):
+        with open(DATASET_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f)
+    
+    with open(DATASET_PATH, "r", encoding="utf-8") as f:
+        try:
+            existing = json.load(f)
+        except json.JSONDecodeError:
+             existing = []
+             st.warning(f"기존 {DATASET_PATH} 파일이 손상되어 초기화합니다.")
 
     # 중복 방지용 해시 집합
     seen = {d.get("_hash") for d in existing if d.get("_hash")}
@@ -349,6 +358,11 @@ def integrated_compare(api_key: str, test_json: Dict[str, Any], local_fail_reaso
     rag_texts = list(set(rag_texts))
 
     # PASS/FAIL 학습 데이터 로드
+    # 파일이 존재하지 않으면 빈 파일 생성 (Streamlit Cloud에서 첫 실행 시 파일이 없기 때문)
+    if not os.path.exists(DATASET_PATH):
+        with open(DATASET_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f)
+
     if os.path.exists(DATASET_PATH):
         with open(DATASET_PATH, "r", encoding="utf-8") as f:
             try:
@@ -406,6 +420,7 @@ def integrated_compare(api_key: str, test_json: Dict[str, Any], local_fail_reaso
 # ==============================
 with st.sidebar:
     st.subheader("🔑 OpenAI 설정")
+    # API 키를 환경 변수에서 가져오도록 유지
     api_key = st.text_input("OpenAI API Key", type="password", value=os.environ.get("OPENAI_API_KEY", ""))
     model = st.selectbox("모델 선택", ["gpt-4o", "gpt-4o-mini"], index=0)
     st.caption("가이드라인 PDF 임베딩 생성 → PASS/FAIL 학습(선택) → 테스트 문서 업로드 순서로 진행하세요.")
