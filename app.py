@@ -378,21 +378,18 @@ with col1:
         test_json = normalize_keys(test_json)  # 일관화
         st.session_state["test_json"] = test_json
         st.success("문서 인식 완료 ✅")
-        st.code(json.dumps(test_json, ensure_ascii=False, indent=2), language="json")
+        st.session_state["doc_json"] = doc_json
 
 # ---------------- 오른쪽: 결과 ----------------
 with col2:
     st.header("④ AI 통합 검토 결과")
-    if st.button("AI 자동 검토 실행"):
-        if not api_key:
-            st.error("API Key가 필요합니다.")
+    if st.button("AI 검토 실행"):
+        doc_json = st.session_state.get("doc_json")  # 세션에서 읽음
+        if not doc_json:
+            st.error("먼저 문서를 업로드해 주세요.")
         else:
-            test_json = st.session_state.get("test_json")
-            if not test_json:
-                st.error("테스트 문서를 먼저 업로드하세요.")
-            else:
-                with st.spinner("AI가 규정 + 유사 예시를 종합 분석 중..."):
-                    result = integrated_compare(api_key, test_json, model)
-                st.success("검토 완료 ✅")
-                st.markdown("**검토 결과 (AI 분석)**")
-                st.write(result)
+            with st.spinner("AI가 문서를 검토 중..."):
+                result = integrated_compare(api_key, doc_json, model)
+            st.success("검토 완료 ✅")
+            st.write(result)
+    
