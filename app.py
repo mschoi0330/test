@@ -1,28 +1,56 @@
-# app.py — PASS/FAIL 레퍼런스 기반 "빈칸만" 점검 + LLM 보조(신뢰도/설명)
+# app.py — 템플릿 분기 + PASS/FAIL 레퍼런스 기반 "빈칸만" 점검 + LLM 보조(신뢰도/설명)
 import streamlit as st
 import os, io, json, re, glob, hashlib, base64
 from datetime import datetime
 from typing import Dict, Any, List
 
-import numpy as np
 from PIL import Image, ImageOps, ImageEnhance
 from openai import OpenAI
 
 # ================== 앱 기본 ==================
-APP_TITLE = "📄 결재 서류 빈칸 점검 (PASS/FAIL 레퍼런스 + LLM 보조)"
+APP_TITLE = "📄 결재 서류 빈칸 점검 (템플릿 분기 + PASS/FAIL + LLM 보조)"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
 APP_ROOT = os.getcwd()
-DATA_DIR = os.path.join(APP_ROOT, "data")
-PASS_DIR = os.path.join(DATA_DIR, "pass_json")
-FAIL_DIR = os.path.join(DATA_DIR, "fail_json")
 
-def ensure_dirs():
-    os.makedirs(PASS_DIR, exist_ok=True)
-    os.makedirs(FAIL_DIR, exist_ok=True)
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
-ensure_dirs()
+# ================== 템플릿 레지스트리 ==================
+# 필요 시 여기만 추가하면 템플릿 확장 가능
+TEMPLATE_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "지출결의서": {
+        "schema_keys": [
+            "제목","attachment_count","회사","사용부서(팀)","사용자",
+            "지급처","업무추진비","결의금액","지급요청일"
+        ],
+        "key_alias": {
+            "사용부서":"사용부서(팀)","부서":"사용부서(팀)",
+            "제 목":"제목","제목 ":"제목",
+            "합계":"결의금액","총합계":"결의금액",
+            "첨부":"attachment_count","첨부파일수":"attachment_count","증빙개수":"attachment_count",
+        },
+        "folder": "expense_voucher",
+    },
+    "파견비신청서": {
+        "schema_keys": [
+            "제목","신청인","신청부서","신청기간","파견근무지",
+            "일비(금액)","일비(산식)","일비(비고)",
+            "교통비(금액)","숙박비(금액)","총합계",
+            "첨부(건수)","attachment_count"
+        ],
+        "key_alias": {
+            "신청자":"신청인","신청부서(팀)":"신청부서","부서":"신청부서",
+            "근무지":"파견근무지","파견지":"파견근무지",
+            "일비 금액":"일비(금액)","일비 산식":"일비(산식)","일비 비고":"일비(비고)",
+            "교통비 금액":"교통비(금액)","숙박비 금액":"숙박비(금액)","합계":"총합계",
+            "첨부":"attachment_count","첨부파일수":"attachment_count","증빙개수":"attachment_count",
+        },
+        "folder": "dispatch_allowance",
+    },
+}
+DEFAULT_TEMPLATE = "지출결의서"
 
 # ================== 유틸 ==================
 def pil_to_b64(img: Image.Image) -> str:
@@ -30,11 +58,11 @@ def pil_to_b64(img: Image.Image) -> str:
     img.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# ================== Vision 전처리/인식 ==================
 def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
+    """저해상도 스크린샷 대응: 확대+대비/샤픈+간이 이진화"""
     img = pil.convert("L")
     w, h = img.size
-    scale = 1600 / max(w, h)
+    scale = 2200 / max(w, h)  # 1600 -> 2200로 상향
     if scale > 1.05:
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     img = ImageEnhance.Contrast(img).enhance(1.25)
@@ -43,167 +71,116 @@ def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
     img = img.point(lambda p: 255 if p > 190 else (0 if p < 120 else p))
     return img.convert("RGB")
 
-# 표준 스키마(필요시 키 추가)
-FIELD_SCHEMA = {
-    "제목": {"required": True, "pattern": r".{2,}"},
-    "attachment_count": {"required": True, "pattern": r"^\d+$"},
-    "회사": {"required": False, "pattern": r".*"},
-    "사용부서(팀)": {"required": False, "pattern": r".*"},
-    "사용자": {"required": False, "pattern": r".*"},
-    "지급처": {"required": False, "pattern": r".*"},
-    "업무추신비": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},  # 오탈자 대비용 예시 키 추가 가능
-    "업무추진비": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},
-    "결의금액": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},
-    "지급요청일": {"required": False, "pattern": r"^\d{4}-\d{2}-\d{2}(\([^)]+\))?$"},
-}
+# ================== 템플릿 보조 함수 ==================
+def detect_template_by_title(title: str) -> str:
+    if not title: 
+        return DEFAULT_TEMPLATE
+    t = title.strip()
+    for name in TEMPLATE_REGISTRY.keys():
+        if name in t:
+            return name
+    # 키워드 휴리스틱
+    if any(k in t for k in ["파견", "파견비", "신청서"]):
+        return "파견비신청서"
+    return DEFAULT_TEMPLATE
 
-# 라벨 정규화(동의어/오탈자 → 표준키)
-KEY_NORMALIZER = {
-    "사용부서": "사용부서(팀)",
-    "부서": "사용부서(팀)",
-    "제 목": "제목",
-    "제목 ": "제목",
-    "합계": "결의금액",
-    "총합계": "결의금액",
-    "업무추신비": "업무추진비",
-}
-
-def _normalize_keys(d: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_keys_template(d: dict, template_name: str) -> dict:
+    aliases = TEMPLATE_REGISTRY.get(template_name, {}).get("key_alias", {})
     out = {}
     for k, v in d.items():
-        k2 = KEY_NORMALIZER.get(str(k).strip(), str(k).strip())
+        k2 = aliases.get(str(k).strip(), str(k).strip())
         out[k2] = v
     return out
 
-def _normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(d)
-    def norm_money(s):
-        s = str(s).strip()
-        s = re.sub(r"[^\d,]", "", s)
-        if s.isdigit():
-            s = f"{int(s):,}"
-        return s
-    if "업무추진비" in out:
-        out["업무추진비"] = norm_money(out["업무추진비"])
-    if "결의금액" in out:
-        out["결의금액"] = norm_money(out["결의금액"])
-    if "지급요청일" in out:
-        s = str(out["지급요청일"])
-        s2 = re.sub(r"[./]", "-", s)
-        m = re.search(r"(\d{4}-\d{2}-\d{2})(\([^)]+\))?", s2)
-        if m:
-            out["지급요청일"] = m.group(0)
-    if "attachment_count" in out:
-        m = re.search(r"\d+", str(out["attachment_count"]))
-        out["attachment_count"] = int(m.group()) if m else 0
-    return out
+def ref_dirs_for_template(template: str):
+    base = TEMPLATE_REGISTRY.get(template, {}).get("folder", "default")
+    pass_dir = os.path.join(APP_ROOT, "data", "templates", base, "pass_json")
+    fail_dir = os.path.join(APP_ROOT, "data", "templates", base, "fail_json")
+    ensure_dir(pass_dir); ensure_dir(fail_dir)
+    return pass_dir, fail_dir
 
-# ===== Vision 호출: (1) 값만 / (2) 신뢰도 포함 =====
-def ask_vision_values(api_key: str, pil_img: Image.Image, model: str) -> Dict[str, Any]:
+# ================== Vision 호출 ==================
+def ask_vision_values(api_key: str, pil_img: Image.Image, model: str, schema_keys: List[str]) -> dict:
     client = OpenAI(api_key=api_key)
     b64 = pil_to_b64(pil_img)
     sys = "설명 없이 JSON만 출력. 지정된 키만 포함."
     usr = (
         "아래 표준키만 포함하는 JSON을 반환해. 키 목록:\n"
-        + list(FIELD_SCHEMA.keys()).__str__()
-        + "\n규칙:\n"
+        + schema_keys.__str__() +
+        "\n규칙:\n"
         "1) 표에 '제목' 셀이 있으면 그 값을 '제목'에. 없으면 상단 큰 제목을 사용.\n"
         "2) 결재/합의/승인/참조/수신 영역은 무시 가능.\n"
-        "3) 'attachment_count'는 숫자만. 없으면 0.\n"
-        "4) '업무추진비','결의금액'은 숫자와 콤마만(예: 150,000).\n"
-        "5) '지급요청일'은 YYYY-MM-DD 또는 YYYY-MM-DD(요일) 형식.\n"
-        "6) JSON만 출력."
+        "3) 'attachment_count' 또는 '첨부(건수)'는 숫자만. 없으면 0.\n"
+        "4) JSON만 출력."
     )
     resp = client.chat.completions.create(
-        model=model, temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": [
-                {"type": "text", "text": usr},
-                {"type": "image_url", "image_url": {"url": b64}},
-            ]},
-        ],
+        model=model, temperature=0, response_format={"type":"json_object"},
+        messages=[{"role":"system","content":sys},
+                  {"role":"user","content":[{"type":"text","text":usr},
+                                            {"type":"image_url","image_url":{"url":b64}}]}]
     )
     return json.loads(resp.choices[0].message.content)
 
-def ask_vision_with_conf(api_key: str, pil_img: Image.Image, model: str) -> Dict[str, Any]:
+def ask_vision_with_conf(api_key: str, pil_img: Image.Image, model: str, schema_keys: List[str]) -> dict:
     client = OpenAI(api_key=api_key)
     b64 = pil_to_b64(pil_img)
-    sys = "설명 없이 JSON만 출력. 각 키는 {'value':..., 'confidence':0~1} 형태."
-    usr = (
-        "표준키만 포함:\n" + list(FIELD_SCHEMA.keys()).__str__() +
-        "\n각 항목은 {'value':<문자열>, 'confidence':<0~1 float>}.\n"
-        "규칙: '제목' 우선, 결재선 무시, attachment_count는 숫자, 날짜/금액 포맷 맞추기."
-    )
+    sys = "설명 없이 JSON만. 각 키는 {'value':..., 'confidence':0~1} 형태."
+    usr = ("표준키만 포함:\n" + schema_keys.__str__() +
+           "\n각 항목은 {'value':<문자열>, 'confidence':<0~1 float>}.\n"
+           "규칙: '제목' 우선, 결재선 무시, 첨부/건수는 숫자.")
     resp = client.chat.completions.create(
-        model=model, temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": [
-                {"type": "text", "text": usr},
-                {"type": "image_url", "image_url": {"url": b64}},
-            ]},
-        ],
+        model=model, temperature=0, response_format={"type":"json_object"},
+        messages=[{"role":"system","content":sys},
+                  {"role":"user","content":[{"type":"text","text":usr},
+                                            {"type":"image_url","image_url":{"url":b64}}]}]
     )
     return json.loads(resp.choices[0].message.content)
 
-def gpt_extract_table(api_key: str, pil_img: Image.Image, model: str, use_confidence: bool) -> Dict[str, Any]:
-    """전처리 + 2패스(모델 교차) + 값 정규화. 신뢰도 모드 시 confidence 포함 구조 허용."""
+# ================== 메인 추출 파이프라인 ==================
+def gpt_extract_table(api_key: str, pil_img: Image.Image, model: str, use_confidence: bool) -> dict:
     img = preprocess_for_ocr(pil_img)
 
+    # 0) 제목만 먼저 빠르게 뽑아 템플릿 추정
+    quick = ask_vision_values(api_key, img, model, schema_keys=["제목"])
+    title = (quick.get("제목") or "").strip()
+    template = detect_template_by_title(title)
+    schema_keys = TEMPLATE_REGISTRY.get(template, TEMPLATE_REGISTRY[DEFAULT_TEMPLATE])["schema_keys"]
+
     # 1차
+    d1 = (ask_vision_with_conf if use_confidence else ask_vision_values)(api_key, img, model, schema_keys)
     if use_confidence:
-        d1 = ask_vision_with_conf(api_key, img, model)
-        d1v = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d1.items()}
-    else:
-        d1 = ask_vision_values(api_key, img, model)
-        d1v = d1
+        d1 = {k:(v.get("value") if isinstance(v,dict) else v) for k,v in d1.items()}
+    d1 = normalize_keys_template(d1, template)
 
     # 2차(교차 모델)
-    alt = "gpt-4o" if model == "gpt-4o-mini" else "gpt-4o-mini"
+    alt = "gpt-4o" if model=="gpt-4o-mini" else "gpt-4o-mini"
+    d2 = (ask_vision_with_conf if use_confidence else ask_vision_values)(api_key, img, alt, schema_keys)
     if use_confidence:
-        d2 = ask_vision_with_conf(api_key, img, alt)
-        d2v = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d2.items()}
-    else:
-        d2 = ask_vision_values(api_key, img, alt)
-        d2v = d2
+        d2 = {k:(v.get("value") if isinstance(v,dict) else v) for k,v in d2.items()}
+    d2 = normalize_keys_template(d2, template)
 
-    # 키/값 정규화
-    d1v = _normalize_values(_normalize_keys(d1v))
-    d2v = _normalize_values(_normalize_keys(d2v))
-
-    # 필드별 선택(패턴 만족 우선)
+    # 간단 병합(값 있으면 채택)
     merged = {}
-    for k in FIELD_SCHEMA.keys():
-        v1, v2 = d1v.get(k), d2v.get(k)
-        if v1 == v2:
-            merged[k] = v1
-        else:
-            pat = FIELD_SCHEMA[k].get("pattern")
-            def ok(v): return bool(re.fullmatch(pat, str(v))) if pat and v is not None else (str(v).strip() != "")
-            merged[k] = v1 if ok(v1) else (v2 if ok(v2) else (v1 or v2 or ""))
+    for k in schema_keys:
+        v1, v2 = d1.get(k), d2.get(k)
+        merged[k] = v1 if str(v1).strip() else (v2 if str(v2).strip() else "")
 
-    # 방어: 제목/첨부 누락 시 1회 재질의
-    if (not merged.get("제목")) or (merged.get("attachment_count", 0) == 0):
-        if use_confidence:
-            d3 = ask_vision_with_conf(api_key, img, model)
-            d3v = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d3.items()}
-        else:
-            d3 = ask_vision_values(api_key, img, model)
-            d3v = d3
-        d3v = _normalize_values(_normalize_keys(d3v))
-        for k in ["제목", "attachment_count"]:
-            if (not merged.get(k)) and d3v.get(k):
-                merged[k] = d3v.get(k)
+    # 공통 보정
+    if "attachment_count" in merged:
+        m = re.search(r"\d+", str(merged["attachment_count"]))
+        merged["attachment_count"] = int(m.group()) if m else 0
+    if "첨부(건수)" in merged and not merged.get("attachment_count"):
+        m = re.search(r"\d+", str(merged["첨부(건수)"]))
+        merged["attachment_count"] = int(m.group()) if m else 0
 
-    if "제목" not in merged: merged["제목"] = ""
-    if "attachment_count" not in merged: merged["attachment_count"] = 0
+    merged["__template__"] = template
+    if "제목" not in merged: merged["제목"] = title
     return merged
 
 # ================== 레퍼런스(빈칸 전용) ==================
-def load_reference_stats_blank_only(pass_dir=PASS_DIR, fail_dir=FAIL_DIR, required_threshold=0.8):
+def load_reference_stats_blank_only_for_template(template: str, required_threshold=0.8):
+    pass_dir, fail_dir = ref_dirs_for_template(template)
+
     def _load_all(p):
         out=[]
         for f in glob.glob(os.path.join(p, "*.json")):
@@ -214,7 +191,6 @@ def load_reference_stats_blank_only(pass_dir=PASS_DIR, fail_dir=FAIL_DIR, requir
     pass_docs = _load_all(pass_dir)
     fail_docs = _load_all(fail_dir)
 
-    # PASS에서 채워진 비율
     filled_ratio = {}
     if pass_docs:
         keys = set().union(*[d.keys() for d in pass_docs])
@@ -223,10 +199,8 @@ def load_reference_stats_blank_only(pass_dir=PASS_DIR, fail_dir=FAIL_DIR, requir
             if vals:
                 filled_ratio[k] = sum(vals) / len(vals)
 
-    # 사실상 필수(기본 0.8)
     inferred_required = {k for k, r in filled_ratio.items() if r >= required_threshold}
 
-    # FAIL에서 자주 비는 항목(참고)
     from collections import Counter
     fail_empty_rank = []
     if fail_docs:
@@ -243,10 +217,11 @@ def load_reference_stats_blank_only(pass_dir=PASS_DIR, fail_dir=FAIL_DIR, requir
         "fail_count": len(fail_docs),
         "filled_ratio": filled_ratio,
         "fail_empty_rank": fail_empty_rank,
+        "pass_dir": pass_dir,
+        "fail_dir": fail_dir,
     }
 
 def report_blanks_only(doc_json: dict, ref_stats: dict):
-    """레퍼런스 기준 '사실상 필수' 필드만 검사 → 빈칸이면 리포트"""
     req = ref_stats.get("inferred_required", set())
     issues = []
     for k in sorted(req):
@@ -289,18 +264,13 @@ with st.sidebar:
     st.subheader("🔑 OpenAI 설정")
     api_key = st.text_input("OpenAI API Key", type="password", value=os.environ.get("OPENAI_API_KEY", ""))
     model_vision = st.selectbox("Vision 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
-    use_confidence = st.toggle("신뢰도(Confidence) 모드 사용", value=False, help="필드별 confidence(0~1)를 활용한 보수적 처리")
+    use_confidence = st.toggle("신뢰도(Confidence) 모드 사용", value=False)
     st.markdown("---")
     llm_help_on = st.toggle("LLM 설명 생성(권고문/이유) 사용", value=False)
-    model_text = st.selectbox("설명용 LLM (텍스트)", ["gpt-4o-mini", "gpt-4o"], index=0, disabled=not llm_help_on)
+    model_text = st.selectbox("설명용 LLM", ["gpt-4o-mini", "gpt-4o"], index=0, disabled=not llm_help_on)
     st.markdown("---")
-    if st.button("레퍼런스 로드/갱신"):
-        st.session_state["ref_blank"] = load_reference_stats_blank_only()
-        rs = st.session_state["ref_blank"]
-        st.success(f"로드 완료 ✅  PASS={rs['pass_count']}, FAIL={rs['fail_count']}, "
-                   f"추론된 필수필드={len(rs['inferred_required'])}")
-        if rs["fail_empty_rank"]:
-            st.caption("FAIL에서 자주 비던 필드: " + ", ".join([k for k,_ in rs["fail_empty_rank"]]))
+    # 템플릿 선택(수동 오버라이드용)
+    manual_template = st.selectbox("템플릿(수동 선택, 자동판별 무시)", ["자동판별"] + list(TEMPLATE_REGISTRY.keys()), index=0)
 
 # ================== 본문 레이아웃 ==================
 col1, col2 = st.columns([1.1, 0.9])
@@ -323,51 +293,52 @@ with col1:
         elif need_run:
             with st.spinner("문서 인식 중..."):
                 doc_json = gpt_extract_table(api_key, preview, model=model_vision, use_confidence=use_confidence)
+                # 수동 템플릿 지정 시 교체
+                if manual_template != "자동판별":
+                    doc_json["__template__"] = manual_template
             st.session_state["doc_json"] = doc_json
             st.session_state["last_img_hash"] = img_hash
-            st.success("문서 인식 완료 ✅")
+            st.success(f"문서 인식 완료 ✅  (템플릿: {st.session_state['doc_json'].get('__template__','?')})")
 
         # === 버튼 3개 ===
         if "doc_json" in st.session_state:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            cur_template = st.session_state["doc_json"].get("__template__", DEFAULT_TEMPLATE)
+            pass_dir, fail_dir = ref_dirs_for_template(cur_template)
+
             b1, b2, b3 = st.columns(3)
 
             with b1:
                 if st.button("PASS 샘플로 저장"):
-                    ensure_dirs()
-                    path = os.path.join(PASS_DIR, f"pass_{ts}.json")
+                    ensure_dir(pass_dir)
+                    path = os.path.join(pass_dir, f"pass_{ts}.json")
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
-                    st.success(f"PASS 샘플 저장 완료: {path}")
+                    st.success(f"[{cur_template}] PASS 샘플 저장 완료: {path}")
 
             with b2:
                 if st.button("FAIL 샘플로 저장"):
-                    ensure_dirs()
-                    path = os.path.join(FAIL_DIR, f"fail_{ts}.json")
+                    ensure_dir(fail_dir)
+                    path = os.path.join(fail_dir, f"fail_{ts}.json")
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
-                    st.success(f"FAIL 샘플 저장 완료: {path}")
+                    st.success(f"[{cur_template}] FAIL 샘플 저장 완료: {path}")
 
             with b3:
                 if st.button("이 문서 빈칸 확인"):
-                    # 레퍼런스 자동 로드 시도
-                    ref = st.session_state.get("ref_blank")
-                    if not ref:
-                        st.session_state["ref_blank"] = load_reference_stats_blank_only()
-                        ref = st.session_state["ref_blank"]
-
+                    template = st.session_state["doc_json"].get("__template__", DEFAULT_TEMPLATE)
+                    ref = load_reference_stats_blank_only_for_template(template)
                     if ref.get("pass_count", 0) + ref.get("fail_count", 0) == 0:
-                        st.warning("레퍼런스 데이터가 없습니다. PASS/FAIL 샘플을 저장한 뒤, 사이드바에서 '레퍼런스 로드/갱신'을 눌러주세요.")
+                        st.warning(f"[{template}] 레퍼런스가 없습니다. PASS/FAIL 샘플을 저장해 주세요.")
                     else:
                         blanks = report_blanks_only(st.session_state["doc_json"], ref)
                         if not blanks:
-                            st.success("빈칸 없음 ✅ (레퍼런스 기준 필수필드 모두 채워짐)")
+                            st.success("빈칸 없음 ✅ (템플릿 레퍼런스 기준 필수필드 모두 채워짐)")
                         else:
                             st.error(f"빈칸 {len(blanks)}건 발견 ❌")
                             with st.expander("빈칸 상세 보기", expanded=True):
                                 for it in blanks:
                                     st.write(f"- **항목명**: {it['항목명']}\n  - 문제점: {it['문제점']}\n  - 수정 예시: {it['수정 예시']}")
-                            # (옵션) LLM 설명
                             if llm_help_on and api_key:
                                 with st.spinner("LLM이 간단 가이드를 작성 중..."):
                                     advice = llm_explain_blanks(api_key, model_text, blanks)
@@ -375,22 +346,25 @@ with col1:
                                     st.markdown("**🔎 입력 가이드 (LLM 요약)**")
                                     st.write(advice)
 
-# -------- 오른쪽: 레퍼런스 현황/설명 --------
+# -------- 오른쪽: 레퍼런스 현황 / 필수 필드 설명 --------
 with col2:
     st.subheader("② 레퍼런스 현황 / 필수 필드 설명")
-    ref = st.session_state.get("ref_blank")
-    if not ref:
-        st.info("사이드바의 [레퍼런스 로드/갱신]을 눌러 주세요.")
-    else:
-        st.write(f"- PASS 샘플: **{ref['pass_count']}**개, FAIL 샘플: **{ref['fail_count']}**개")
-        st.write(f"- 추론된 '사실상 필수' 필드 수: **{len(ref['inferred_required'])}**개")
-        if ref["inferred_required"]:
-            st.write("필수로 간주된 필드 예:", ", ".join(list(ref["inferred_required"])[:8]) + (" ..." if len(ref["inferred_required"])>8 else ""))
+    # 현재 문서 템플릿 기준 현황 표시
+    cur_template = (st.session_state.get("doc_json") or {}).get("__template__", DEFAULT_TEMPLATE)
+    ref = load_reference_stats_blank_only_for_template(cur_template)
+    st.write(f"- 현재 템플릿: **{cur_template}**")
+    st.write(f"- PASS 샘플: **{ref['pass_count']}**개, FAIL 샘플: **{ref['fail_count']}**개")
+    st.write(f"- 추론된 '사실상 필수' 필드 수: **{len(ref['inferred_required'])}**개")
+    if ref["inferred_required"]:
+        st.write("필수로 간주된 필드 예:", ", ".join(list(ref["inferred_required"])[:10]) + (" ..." if len(ref["inferred_required"])>10 else ""))
 
-        if llm_help_on and api_key and ref.get("filled_ratio"):
-            if st.button("필수로 보는 이유 한 줄 설명(LLM)"):
-                with st.spinner("LLM이 요약 설명 작성 중..."):
-                    msg = llm_explain_required(api_key, model_text, ref["filled_ratio"], topk=5)
-                if msg:
-                    st.markdown("**📝 왜 필수로 보나요? (LLM 요약)**")
-                    st.write(msg)
+    if ref["fail_empty_rank"]:
+        st.caption("FAIL에서 자주 비던 필드 Top: " + ", ".join([f"{k}({c})" for k,c in ref["fail_empty_rank"]]))
+
+    if llm_help_on and api_key and ref.get("filled_ratio"):
+        if st.button("필수로 보는 이유 한 줄 설명(LLM)"):
+            with st.spinner("LLM이 요약 설명 작성 중..."):
+                msg = llm_explain_required(api_key, model_text, ref["filled_ratio"], topk=5)
+            if msg:
+                st.markdown("**📝 왜 필수로 보나요? (LLM 요약)**")
+                st.write(msg)
