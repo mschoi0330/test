@@ -1,122 +1,38 @@
+# app.py — PASS/FAIL 레퍼런스 기반 "빈칸만" 점검 + LLM 보조(신뢰도/설명)
 import streamlit as st
-import os
-import io
-import base64
-import json
-import hashlib
-import re
-import glob
+import os, io, json, re, glob, hashlib, base64
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Dict, Any, List
 
+import numpy as np
 from PIL import Image, ImageOps, ImageEnhance
 from openai import OpenAI
-from pypdf import PdfReader
-import chromadb
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-
-APP_TITLE = "📄 AI 결재 사전검토"
-
+# ================== 앱 기본 ==================
+APP_TITLE = "📄 결재 서류 빈칸 점검 (PASS/FAIL 레퍼런스 + LLM 보조)"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
-# -------------------- 경로/폴더 --------------------
 APP_ROOT = os.getcwd()
-DB_DIR = os.path.join(APP_ROOT, "chroma_db")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 PASS_DIR = os.path.join(DATA_DIR, "pass_json")
 FAIL_DIR = os.path.join(DATA_DIR, "fail_json")
 
 def ensure_dirs():
-    os.makedirs(DB_DIR, exist_ok=True)
     os.makedirs(PASS_DIR, exist_ok=True)
     os.makedirs(FAIL_DIR, exist_ok=True)
 
 ensure_dirs()
 
-# -------------------- Chroma 초기화 --------------------
-chroma_client = chromadb.PersistentClient(path=DB_DIR)
-GUIDE_COLLECTION_NAME = "company_guideline"
-
-
-# -------------------- PDF → 텍스트 --------------------
-def pdf_to_text(file: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file))
-    texts = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(texts)
-
-
-# -------------------- 텍스트 → 청크 --------------------
-def split_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
-    text = text.replace("\r", "\n")
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        if chunk.strip():
-            chunks.append(chunk)
-        start = end - overlap
-    return chunks
-
-
-# -------------------- 임베딩 --------------------
-def embed_texts(texts: List[str], api_key: str) -> List[List[float]]:
-    if not texts:
-        return []
-    embedder = OpenAIEmbeddings(model="text-embedding-3-large", api_key=api_key)
-    return embedder.embed_documents(texts)
-
-
-# -------------------- Chroma 저장 --------------------
-def save_guideline_to_chroma(chunks: List[str], embeddings: List[List[float]]):
-    if not chunks or not embeddings:
-        st.error("가이드라인 PDF에서 텍스트를 못 뽑았어요.")
-        return
-    col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
-    col.delete(where={"source": "guideline"})
-    ids = [f"guide_{i}" for i in range(len(chunks))]
-    metas = [{"source": "guideline", "chunk": i} for i in range(len(chunks))]
-    col.add(ids=ids, documents=chunks, metadatas=metas, embeddings=embeddings)
-    st.success(f"가이드라인 {len(chunks)}개 저장 완료 ✅")
-
-
-def save_caution_to_chroma(chunks: List[str], embeddings: List[List[float]]):
-    if not chunks or not embeddings:
-        st.error("유의사항 PDF에서 텍스트를 못 뽑았어요.")
-        return
-    col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
-    col.delete(where={"source": "caution"})
-    base = 10_000
-    ids = [f"caution_{base + i}" for i in range(len(chunks))]
-    metas = [{"source": "caution", "chunk": i} for i in range(len(chunks))]
-    col.add(ids=ids, documents=chunks, metadatas=metas, embeddings=embeddings)
-    st.success(f"유의사항 {len(chunks)}개 저장 완료 ✅")
-
-
-# -------------------- Chroma 검색 --------------------
-def search_guideline(query: str, api_key: str, k: int = 4) -> List[Dict[str, Any]]:
-    col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
-    embedder = OpenAIEmbeddings(model="text-embedding-3-large", api_key=api_key)
-    q_emb = embedder.embed_query(query)
-    result = col.query(query_embeddings=[q_emb], n_results=k)
-    docs = []
-    for i in range(len(result["documents"][0])):
-        docs.append({"text": result["documents"][0][i], "metadata": result["metadatas"][0][i]})
-    return docs
-
-
-# -------------------- Vision 유틸 --------------------
+# ================== 유틸 ==================
 def pil_to_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
-
-# ===== 인식 품질 개선: 전처리 + 스키마 고정 + 2패스 재시도 =====
+# ================== Vision 전처리/인식 ==================
 def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
-    img = pil.convert("L")  # grayscale
+    img = pil.convert("L")
     w, h = img.size
     scale = 1600 / max(w, h)
     if scale > 1.05:
@@ -127,19 +43,21 @@ def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
     img = img.point(lambda p: 255 if p > 190 else (0 if p < 120 else p))
     return img.convert("RGB")
 
-
+# 표준 스키마(필요시 키 추가)
 FIELD_SCHEMA = {
     "제목": {"required": True, "pattern": r".{2,}"},
     "attachment_count": {"required": True, "pattern": r"^\d+$"},
-    "회사": {"required": True, "pattern": r".{2,}"},
-    "사용부서(팀)": {"required": True, "pattern": r".{1,}"},
-    "사용자": {"required": True, "pattern": r".{1,}"},
+    "회사": {"required": False, "pattern": r".*"},
+    "사용부서(팀)": {"required": False, "pattern": r".*"},
+    "사용자": {"required": False, "pattern": r".*"},
     "지급처": {"required": False, "pattern": r".*"},
+    "업무추신비": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},  # 오탈자 대비용 예시 키 추가 가능
     "업무추진비": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},
     "결의금액": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},
     "지급요청일": {"required": False, "pattern": r"^\d{4}-\d{2}-\d{2}(\([^)]+\))?$"},
 }
 
+# 라벨 정규화(동의어/오탈자 → 표준키)
 KEY_NORMALIZER = {
     "사용부서": "사용부서(팀)",
     "부서": "사용부서(팀)",
@@ -147,163 +65,156 @@ KEY_NORMALIZER = {
     "제목 ": "제목",
     "합계": "결의금액",
     "총합계": "결의금액",
+    "업무추신비": "업무추진비",
 }
-
 
 def _normalize_keys(d: Dict[str, Any]) -> Dict[str, Any]:
     out = {}
     for k, v in d.items():
-        k2 = KEY_NORMALIZER.get(k.strip(), k.strip())
+        k2 = KEY_NORMALIZER.get(str(k).strip(), str(k).strip())
         out[k2] = v
     return out
 
-
 def _normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(d)
-
     def norm_money(s):
         s = str(s).strip()
-        s = re.sub(r"[^\d,]", "", s)  # "150,000원" -> "150,000"
+        s = re.sub(r"[^\d,]", "", s)
         if s.isdigit():
             s = f"{int(s):,}"
         return s
-
     if "업무추진비" in out:
         out["업무추진비"] = norm_money(out["업무추진비"])
     if "결의금액" in out:
         out["결의금액"] = norm_money(out["결의금액"])
-
     if "지급요청일" in out:
         s = str(out["지급요청일"])
-        s2 = re.sub(r"[./]", "-", s)  # 2025.11.06 → 2025-11-06
+        s2 = re.sub(r"[./]", "-", s)
         m = re.search(r"(\d{4}-\d{2}-\d{2})(\([^)]+\))?", s2)
         if m:
             out["지급요청일"] = m.group(0)
-
     if "attachment_count" in out:
         m = re.search(r"\d+", str(out["attachment_count"]))
         out["attachment_count"] = int(m.group()) if m else 0
-
     return out
 
-
-def _validate_schema(d: Dict[str, Any]) -> Dict[str, Any]:
-    notes = []
-    for k, rule in FIELD_SCHEMA.items():
-        if rule["required"] and (k not in d or str(d[k]).strip() == ""):
-            notes.append(f"필수값 누락: {k}")
-        if k in d and rule.get("pattern"):
-            if not re.fullmatch(rule["pattern"], str(d[k])):
-                notes.append(f"형식 불일치: {k}={d[k]}")
-    d["_notes"] = notes
-    return d
-
-
-def _ask_vision(api_key: str, pil_img: Image.Image, model: str, strict_json=True) -> Dict[str, Any]:
+# ===== Vision 호출: (1) 값만 / (2) 신뢰도 포함 =====
+def ask_vision_values(api_key: str, pil_img: Image.Image, model: str) -> Dict[str, Any]:
     client = OpenAI(api_key=api_key)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    system_msg = (
-        "너는 회사 결재/경비 문서 이미지를 읽어 정해진 JSON 스키마로만 반환하는 AI다. 설명 없이 JSON만 출력한다."
-    )
-    user_msg = (
-        "다음 키만 포함하는 JSON을 반환해. 키는 정확히 아래와 일치해야 한다.\n"
+    b64 = pil_to_b64(pil_img)
+    sys = "설명 없이 JSON만 출력. 지정된 키만 포함."
+    usr = (
+        "아래 표준키만 포함하는 JSON을 반환해. 키 목록:\n"
         + list(FIELD_SCHEMA.keys()).__str__()
         + "\n규칙:\n"
         "1) 표에 '제목' 셀이 있으면 그 값을 '제목'에. 없으면 상단 큰 제목을 사용.\n"
-        "2) 결재/합의/승인/참조/수신 영역은 무시. 필요 시 'approval_line_ignored': true를 추가 가능.\n"
-        "3) 'attachment_count'는 숫자만. 해당 칸이 없으면 0.\n"
+        "2) 결재/합의/승인/참조/수신 영역은 무시 가능.\n"
+        "3) 'attachment_count'는 숫자만. 없으면 0.\n"
         "4) '업무추진비','결의금액'은 숫자와 콤마만(예: 150,000).\n"
         "5) '지급요청일'은 YYYY-MM-DD 또는 YYYY-MM-DD(요일) 형식.\n"
-        "6) JSON만 출력해."
+        "6) JSON만 출력."
     )
-
-    kwargs = dict(
-        model=model,
-        temperature=0,
+    resp = client.chat.completions.create(
+        model=model, temperature=0,
+        response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": system_msg},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_msg},
-                    {"type": "image_url", "image_url": {"url": b64}},
-                ],
-            },
+            {"role": "system", "content": sys},
+            {"role": "user", "content": [
+                {"type": "text", "text": usr},
+                {"type": "image_url", "image_url": {"url": b64}},
+            ]},
         ],
     )
-    if strict_json:
-        kwargs["response_format"] = {"type": "json_object"}
+    return json.loads(resp.choices[0].message.content)
 
-    resp = client.chat.completions.create(**kwargs)
-    content = resp.choices[0].message.content.strip()
-    try:
-        return json.loads(content)
-    except Exception:
-        return {"_raw": content}
+def ask_vision_with_conf(api_key: str, pil_img: Image.Image, model: str) -> Dict[str, Any]:
+    client = OpenAI(api_key=api_key)
+    b64 = pil_to_b64(pil_img)
+    sys = "설명 없이 JSON만 출력. 각 키는 {'value':..., 'confidence':0~1} 형태."
+    usr = (
+        "표준키만 포함:\n" + list(FIELD_SCHEMA.keys()).__str__() +
+        "\n각 항목은 {'value':<문자열>, 'confidence':<0~1 float>}.\n"
+        "규칙: '제목' 우선, 결재선 무시, attachment_count는 숫자, 날짜/금액 포맷 맞추기."
+    )
+    resp = client.chat.completions.create(
+        model=model, temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": [
+                {"type": "text", "text": usr},
+                {"type": "image_url", "image_url": {"url": b64}},
+            ]},
+        ],
+    )
+    return json.loads(resp.choices[0].message.content)
 
-
-def gpt_extract_table(api_key: str, pil_img: Image.Image, model: str = "gpt-4o") -> Dict[str, Any]:
-    """
-    개선된 2-패스 추출:
-    - 이미지 전처리
-    - 강제 JSON + 스키마 고정
-    - mini ↔ 4o 교차 재시도 후 사후 보정/검증
-    """
+def gpt_extract_table(api_key: str, pil_img: Image.Image, model: str, use_confidence: bool) -> Dict[str, Any]:
+    """전처리 + 2패스(모델 교차) + 값 정규화. 신뢰도 모드 시 confidence 포함 구조 허용."""
     img = preprocess_for_ocr(pil_img)
 
     # 1차
-    data1 = _ask_vision(api_key, img, model=model, strict_json=True)
-    # 2차: 보조 모델 교차
-    alt_model = "gpt-4o-mini" if model == "gpt-4o" else "gpt-4o"
-    data2 = _ask_vision(api_key, img, model=alt_model, strict_json=True)
+    if use_confidence:
+        d1 = ask_vision_with_conf(api_key, img, model)
+        d1v = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d1.items()}
+    else:
+        d1 = ask_vision_values(api_key, img, model)
+        d1v = d1
 
-    data1 = _normalize_values(_normalize_keys(data1))
-    data2 = _normalize_values(_normalize_keys(data2))
+    # 2차(교차 모델)
+    alt = "gpt-4o" if model == "gpt-4o-mini" else "gpt-4o-mini"
+    if use_confidence:
+        d2 = ask_vision_with_conf(api_key, img, alt)
+        d2v = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d2.items()}
+    else:
+        d2 = ask_vision_values(api_key, img, alt)
+        d2v = d2
 
+    # 키/값 정규화
+    d1v = _normalize_values(_normalize_keys(d1v))
+    d2v = _normalize_values(_normalize_keys(d2v))
+
+    # 필드별 선택(패턴 만족 우선)
     merged = {}
     for k in FIELD_SCHEMA.keys():
-        v1, v2 = data1.get(k), data2.get(k)
+        v1, v2 = d1v.get(k), d2v.get(k)
         if v1 == v2:
             merged[k] = v1
         else:
             pat = FIELD_SCHEMA[k].get("pattern")
-            def ok(v): return bool(re.fullmatch(pat, str(v))) if pat and v is not None else False
+            def ok(v): return bool(re.fullmatch(pat, str(v))) if pat and v is not None else (str(v).strip() != "")
             merged[k] = v1 if ok(v1) else (v2 if ok(v2) else (v1 or v2 or ""))
 
-    merged = _validate_schema(merged)
-
-    # 제목/첨부 누락 시 마지막 방어 재시도
-    need_reask = False
+    # 방어: 제목/첨부 누락 시 1회 재질의
     if (not merged.get("제목")) or (merged.get("attachment_count", 0) == 0):
-        data3 = _ask_vision(api_key, img, model=model, strict_json=True)
-        data3 = _normalize_values(_normalize_keys(data3))
+        if use_confidence:
+            d3 = ask_vision_with_conf(api_key, img, model)
+            d3v = {k: (v.get("value") if isinstance(v, dict) else v) for k, v in d3.items()}
+        else:
+            d3 = ask_vision_values(api_key, img, model)
+            d3v = d3
+        d3v = _normalize_values(_normalize_keys(d3v))
         for k in ["제목", "attachment_count"]:
-            if (not merged.get(k)) and data3.get(k):
-                merged[k] = data3.get(k)
-                need_reask = True
-    if need_reask:
-        merged = _validate_schema(merged)
+            if (not merged.get(k)) and d3v.get(k):
+                merged[k] = d3v.get(k)
 
+    if "제목" not in merged: merged["제목"] = ""
+    if "attachment_count" not in merged: merged["attachment_count"] = 0
     return merged
 
-
-# -------------------- 레퍼런스 통계 --------------------
-def load_reference_stats(pass_dir=PASS_DIR, fail_dir=FAIL_DIR):
+# ================== 레퍼런스(빈칸 전용) ==================
+def load_reference_stats_blank_only(pass_dir=PASS_DIR, fail_dir=FAIL_DIR, required_threshold=0.8):
     def _load_all(p):
-        out = []
+        out=[]
         for f in glob.glob(os.path.join(p, "*.json")):
-            try:
-                out.append(json.load(open(f, "r", encoding="utf-8")))
-            except Exception:
-                pass
+            try: out.append(json.load(open(f, "r", encoding="utf-8")))
+            except: pass
         return out
 
     pass_docs = _load_all(pass_dir)
     fail_docs = _load_all(fail_dir)
 
+    # PASS에서 채워진 비율
     filled_ratio = {}
     if pass_docs:
         keys = set().union(*[d.keys() for d in pass_docs])
@@ -312,145 +223,93 @@ def load_reference_stats(pass_dir=PASS_DIR, fail_dir=FAIL_DIR):
             if vals:
                 filled_ratio[k] = sum(vals) / len(vals)
 
-    # 사실상 필수(예: 0.8 이상)
-    inferred_required = {k for k, r in filled_ratio.items() if r >= 0.8}
+    # 사실상 필수(기본 0.8)
+    inferred_required = {k for k, r in filled_ratio.items() if r >= required_threshold}
 
-    # FAIL에서 자주 비는 필드 (상위 5)
+    # FAIL에서 자주 비는 항목(참고)
+    from collections import Counter
     fail_empty_rank = []
     if fail_docs:
-        from collections import Counter
         cnt = Counter()
         for d in fail_docs:
             for k, v in d.items():
                 if str(v).strip() == "":
                     cnt[k] += 1
-        fail_empty_rank = cnt.most_common(5)
+        fail_empty_rank = cnt.most_common(10)
 
     return {
-        "pass_docs": pass_docs,
-        "fail_docs": fail_docs,
-        "filled_ratio": filled_ratio,
         "inferred_required": inferred_required,
-        "fail_empty_rank": fail_empty_rank,
         "pass_count": len(pass_docs),
         "fail_count": len(fail_docs),
+        "filled_ratio": filled_ratio,
+        "fail_empty_rank": fail_empty_rank,
     }
 
-
-def compare_with_reference(doc_json: Dict[str, Any], ref_stats: Dict[str, Any]):
-    issues = []
+def report_blanks_only(doc_json: dict, ref_stats: dict):
+    """레퍼런스 기준 '사실상 필수' 필드만 검사 → 빈칸이면 리포트"""
     req = ref_stats.get("inferred_required", set())
-
+    issues = []
     for k in sorted(req):
         if str(doc_json.get(k, "")).strip() == "":
-            issues.append({"항목명": k, "문제점": "레퍼런스 기준 필수값 누락", "수정 예시": f"{k} 값을 기입하세요."})
+            issues.append({"항목명": k, "문제점": "빈칸", "수정 예시": f"{k} 값을 입력하세요."})
+    return issues
 
-    # 간단한 금액/형식 검증(보정된 스키마와 일치하지 않으면 지적)
-    money_keys = ["업무추진비", "결의금액", "공급가액", "부가세", "합계"]
-    for k in money_keys:
-        v = str(doc_json.get(k, "")).strip()
-        if v and not re.fullmatch(r"^\d{1,3}(,\d{3})*$", v):
-            issues.append({"항목명": k, "문제점": "금액 형식 불일치(예: 150,000)", "수정 예시": "숫자/콤마만 사용"})
+# ================== LLM 설명(옵션) ==================
+def llm_explain_required(api_key: str, model: str, filled_ratio: dict, topk=5) -> str:
+    if not filled_ratio: return ""
+    client = OpenAI(api_key=api_key)
+    top = sorted(filled_ratio.items(), key=lambda x: -x[1])[:topk]
+    prompt = (
+        "다음 채움율 목록을 바탕으로 왜 해당 필드들을 '사실상 필수'로 보는지 한 줄 요약을 작성해줘. "
+        "실무자가 이해하기 쉽게, 한국어, 간결하게.\n" + json.dumps(top, ensure_ascii=False)
+    )
+    resp = client.chat.completions.create(
+        model=model, temperature=0.2,
+        messages=[{"role":"system","content":"간결한 한국어 설명만 출력"},
+                  {"role":"user","content":prompt}]
+    )
+    return resp.choices[0].message.content.strip()
 
-    common_empty = [k for k, _ in ref_stats.get("fail_empty_rank", [])]
-    return issues, common_empty
+def llm_explain_blanks(api_key: str, model: str, blanks: List[dict]) -> str:
+    if not blanks: return ""
+    client = OpenAI(api_key=api_key)
+    prompt = (
+        "다음 항목들이 빈칸입니다. 사용자가 바로 채울 수 있도록 간단·구체·한 줄 가이드로 요약해줘. "
+        "불필요한 서론 없이 목록 형태로.\n" + json.dumps(blanks, ensure_ascii=False)
+    )
+    resp = client.chat.completions.create(
+        model=model, temperature=0.2,
+        messages=[{"role":"system","content":"간결한 한국어 목록만 출력"},
+                  {"role":"user","content":prompt}]
+    )
+    return resp.choices[0].message.content.strip()
 
-
-# -------------------- LLM 비교 (전체 출력 버전) --------------------
-def compare_doc_with_guideline(
-    api_key: str,
-    doc_json: Dict[str, Any],
-    guideline_chunks: List[str],
-    model: str = "gpt-4o",
-) -> str:
-    llm = ChatOpenAI(model=model, temperature=0.0, api_key=api_key, max_tokens=2200)
-
-    MAX_GUIDE = 12
-    guideline_text = "\n\n".join(guideline_chunks[:MAX_GUIDE])
-    user_doc_text = json.dumps(doc_json, ensure_ascii=False, indent=2)
-
-    prompt = f"""
-너는 회사 결재/경비 서류를 사전 검토하는 AI다.
-
-[회사 가이드라인 및 유의사항 일부 (최대 {MAX_GUIDE}개)]
-{guideline_text}
-
-[사용자가 제출한 결재 서류(JSON)]
-{user_doc_text}
-
-요구사항:
-1. 발견할 수 있는 모든 위반·누락·형식오류를 전부 나열해라.
-2. 특히 다음은 반드시 체크:
-   - '제목'이 비어 있거나 불완전한지
-   - attachment_count가 0인데 문서 내용에 '출장','법인카드','개인카드','경비','지급요청','증빙','영수증' 등이 있는지
-   - 필수 필드(지급요청일, 증빙유형, 카드내역 등)가 비어있는지
-3. 결재선(결재/합의/승인/참조/수신)은 문제로 삼지 마라.
-4. 출력 형식:
-
-- 항목명: ...
-- 문제점: ...
-- 수정 예시: ...
-
-- 항목명: ...
-- 문제점: ...
-- 수정 예시: ...
-"""
-    res = llm.invoke(prompt)
-    return res.content if hasattr(res, "content") else str(res)
-
-
-# ============================ UI ============================
+# ================== 사이드바 ==================
 with st.sidebar:
     st.subheader("🔑 OpenAI 설정")
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        value=os.environ.get("OPENAI_API_KEY", ""),
-    )
-    model = st.selectbox("GPT Vision / LLM 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
+    api_key = st.text_input("OpenAI API Key", type="password", value=os.environ.get("OPENAI_API_KEY", ""))
+    model_vision = st.selectbox("Vision 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
+    use_confidence = st.toggle("신뢰도(Confidence) 모드 사용", value=False, help="필드별 confidence(0~1)를 활용한 보수적 처리")
     st.markdown("---")
-    if st.button("레퍼런스 통계 로드 / 갱신"):
-        st.session_state["ref_stats"] = load_reference_stats()
-        rs = st.session_state["ref_stats"]
-        st.success(
-            f"레퍼런스 갱신 완료 ✅  (PASS: {rs['pass_count']}개, FAIL: {rs['fail_count']}개, "
-            f"추론된 필수 필드: {len(rs['inferred_required'])}개)"
-        )
+    llm_help_on = st.toggle("LLM 설명 생성(권고문/이유) 사용", value=False)
+    model_text = st.selectbox("설명용 LLM (텍스트)", ["gpt-4o-mini", "gpt-4o"], index=0, disabled=not llm_help_on)
+    st.markdown("---")
+    if st.button("레퍼런스 로드/갱신"):
+        st.session_state["ref_blank"] = load_reference_stats_blank_only()
+        rs = st.session_state["ref_blank"]
+        st.success(f"로드 완료 ✅  PASS={rs['pass_count']}, FAIL={rs['fail_count']}, "
+                   f"추론된 필수필드={len(rs['inferred_required'])}")
         if rs["fail_empty_rank"]:
-            st.caption("과거 FAIL에서 자주 비던 필드(상위): " + ", ".join([k for k,_ in rs["fail_empty_rank"]]))
+            st.caption("FAIL에서 자주 비던 필드: " + ", ".join([k for k,_ in rs["fail_empty_rank"]]))
 
+# ================== 본문 레이아웃 ==================
 col1, col2 = st.columns([1.1, 0.9])
 
-# ------------ 왼쪽: 업로드 ------------
+# -------- 왼쪽: 업로드/저장/확인(버튼 3개) --------
 with col1:
-    st.subheader("① 가이드라인 PDF 업로드")
-    pdf_file = st.file_uploader("가이드라인 PDF", type=["pdf"], key="guide_pdf")
-    if pdf_file is not None and st.button("가이드라인 임베딩 생성/업데이트"):
-        if not api_key:
-            st.error("먼저 API Key를 입력하세요.")
-        else:
-            raw = pdf_to_text(pdf_file.read())
-            chunks = split_text(raw, chunk_size=800, overlap=120)
-            embs = embed_texts(chunks, api_key)
-            save_guideline_to_chroma(chunks, embs)
-            st.session_state["guideline_ready"] = True
+    st.subheader("① 결재/경비 서류 이미지 업로드")
+    img_file = st.file_uploader("이미지 (jpg/png)", type=["jpg","jpeg","png"], key="doc_img")
 
-    st.subheader("② 유의사항 PDF 업로드")
-    caution_pdf = st.file_uploader("유의사항 PDF", type=["pdf"], key="caution_pdf")
-    if caution_pdf is not None and st.button("유의사항 임베딩 생성/업데이트"):
-        if not api_key:
-            st.error("먼저 API Key를 입력하세요.")
-        else:
-            raw = pdf_to_text(caution_pdf.read())
-            chunks = split_text(raw, chunk_size=800, overlap=100)
-            embs = embed_texts(chunks, api_key)
-            save_caution_to_chroma(chunks, embs)
-            st.session_state["caution_ready"] = True
-
-    st.subheader("③ 결재/경비 서류 이미지 업로드")
-    img_file = st.file_uploader("이미지 (jpg/png)", type=["jpg", "jpeg", "png"], key="doc_img")
-
-    # 업로드 시 자동 인식
     if img_file is not None:
         img_bytes = img_file.getvalue()
         img_hash = hashlib.md5(img_bytes).hexdigest()
@@ -459,107 +318,79 @@ with col1:
         st.image(preview, caption="업로드한 결재 문서", use_container_width=True)
 
         need_run = st.session_state.get("last_img_hash") != img_hash or "doc_json" not in st.session_state
-
         if not api_key:
             st.warning("API Key가 필요합니다. 사이드바에 입력해 주세요.")
         elif need_run:
-            with st.spinner("GPT가 문서 인식 중..."):
-                doc_json = gpt_extract_table(api_key, preview, model=model)
+            with st.spinner("문서 인식 중..."):
+                doc_json = gpt_extract_table(api_key, preview, model=model_vision, use_confidence=use_confidence)
             st.session_state["doc_json"] = doc_json
             st.session_state["last_img_hash"] = img_hash
             st.success("문서 인식 완료 ✅")
 
-        # 저장 버튼 (PASS / FAIL)
-        c1, c2 = st.columns(2)
+        # === 버튼 3개 ===
         if "doc_json" in st.session_state:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            with c1:
-                if st.button("현재 인식 결과를 PASS 샘플로 저장"):
+            b1, b2, b3 = st.columns(3)
+
+            with b1:
+                if st.button("PASS 샘플로 저장"):
                     ensure_dirs()
                     path = os.path.join(PASS_DIR, f"pass_{ts}.json")
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
                     st.success(f"PASS 샘플 저장 완료: {path}")
-            with c2:
-                if st.button("현재 인식 결과를 FAIL 샘플로 저장"):
+
+            with b2:
+                if st.button("FAIL 샘플로 저장"):
                     ensure_dirs()
                     path = os.path.join(FAIL_DIR, f"fail_{ts}.json")
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(st.session_state["doc_json"], f, ensure_ascii=False, indent=2)
                     st.success(f"FAIL 샘플 저장 완료: {path}")
 
-        # 결과 JSON은 화면에 표시하지 않음
-        if "doc_json" in st.session_state:
-            pass
+            with b3:
+                if st.button("이 문서 빈칸 확인"):
+                    # 레퍼런스 자동 로드 시도
+                    ref = st.session_state.get("ref_blank")
+                    if not ref:
+                        st.session_state["ref_blank"] = load_reference_stats_blank_only()
+                        ref = st.session_state["ref_blank"]
 
-# ------------ 오른쪽: 비교 ------------
+                    if ref.get("pass_count", 0) + ref.get("fail_count", 0) == 0:
+                        st.warning("레퍼런스 데이터가 없습니다. PASS/FAIL 샘플을 저장한 뒤, 사이드바에서 '레퍼런스 로드/갱신'을 눌러주세요.")
+                    else:
+                        blanks = report_blanks_only(st.session_state["doc_json"], ref)
+                        if not blanks:
+                            st.success("빈칸 없음 ✅ (레퍼런스 기준 필수필드 모두 채워짐)")
+                        else:
+                            st.error(f"빈칸 {len(blanks)}건 발견 ❌")
+                            with st.expander("빈칸 상세 보기", expanded=True):
+                                for it in blanks:
+                                    st.write(f"- **항목명**: {it['항목명']}\n  - 문제점: {it['문제점']}\n  - 수정 예시: {it['수정 예시']}")
+                            # (옵션) LLM 설명
+                            if llm_help_on and api_key:
+                                with st.spinner("LLM이 간단 가이드를 작성 중..."):
+                                    advice = llm_explain_blanks(api_key, model_text, blanks)
+                                if advice:
+                                    st.markdown("**🔎 입력 가이드 (LLM 요약)**")
+                                    st.write(advice)
+
+# -------- 오른쪽: 레퍼런스 현황/설명 --------
 with col2:
-    st.subheader("④ 가이드라인 + 유의사항과 비교")
-    if st.button("자동 검토 실행"):
-        if not api_key:
-            st.error("API Key가 필요합니다.")
-        else:
-            doc_json = st.session_state.get("doc_json")
-            if not doc_json:
-                st.error("먼저 결재 서류 이미지를 올리고 인식하세요.")
-            else:
-                guide_qs = [
-                    "출장비용지급품의 작성 시 필수 항목은 무엇인가",
-                    "지급요청일 입력 규칙은 무엇인가",
-                    "증빙유형, 카드내역 입력 규칙은 무엇인가",
-                ]
-                caution_qs = [
-                    "경비청구 시 주의해야 할 사항",
-                    "허용되지 않는 비용과 예외 규정",
-                ]
-                attach_qs = [
-                    "영수증, 카드전표, 첨부파일에 대한 규칙",
-                    "법인카드 또는 개인카드 사용 시 필요한 첨부 서류",
-                ]
+    st.subheader("② 레퍼런스 현황 / 필수 필드 설명")
+    ref = st.session_state.get("ref_blank")
+    if not ref:
+        st.info("사이드바의 [레퍼런스 로드/갱신]을 눌러 주세요.")
+    else:
+        st.write(f"- PASS 샘플: **{ref['pass_count']}**개, FAIL 샘플: **{ref['fail_count']}**개")
+        st.write(f"- 추론된 '사실상 필수' 필드 수: **{len(ref['inferred_required'])}**개")
+        if ref["inferred_required"]:
+            st.write("필수로 간주된 필드 예:", ", ".join(list(ref["inferred_required"])[:8]) + (" ..." if len(ref["inferred_required"])>8 else ""))
 
-                retrieved_texts: List[str] = []
-                for q in guide_qs:
-                    for r in search_guideline(q, api_key, k=3):
-                        if r["metadata"].get("source") == "guideline":
-                            retrieved_texts.append(r["text"])
-                for q in caution_qs:
-                    for r in search_guideline(q, api_key, k=3):
-                        if r["metadata"].get("source") == "caution":
-                            retrieved_texts.append(r["text"])
-                for q in attach_qs:
-                    for r in search_guideline(q, api_key, k=2):
-                        retrieved_texts.append(r["text"])
-
-                if not retrieved_texts:
-                    st.error("가이드라인/유의사항이 없습니다. 먼저 PDF를 임베딩하세요.")
-                else:
-                    with st.spinner("가이드라인과 비교 중... (모든 위반사항을 찾는 중)"):
-                        answer = compare_doc_with_guideline(api_key, doc_json, retrieved_texts, model=model)
-
-                    st.success("검토 완료 ✅")
-                    st.markdown("**검토 결과**")
-                    st.write(answer)
-
-                    # 레퍼런스 기반 추가 점검
-                    ref_stats = st.session_state.get("ref_stats")
-                    if ref_stats:
-                        add_issues, common_empty = compare_with_reference(doc_json, ref_stats)
-                        if add_issues or common_empty:
-                            st.markdown("---")
-                            st.markdown("**레퍼런스 기반 추가 점검**")
-                            for it in add_issues:
-                                st.write(f"- 항목명: {it['항목명']}\n  - 문제점: {it['문제점']}\n  - 수정 예시: {it['수정 예시']}")
-                            if common_empty:
-                                st.caption("과거 FAIL에서 자주 비던 필드(참고): " + ", ".join(common_empty))
-
-                    payload = {
-                        "doc_json": doc_json,
-                        "retrieved_guideline_texts": retrieved_texts,
-                        "analysis": answer,
-                    }
-                    st.download_button(
-                        "검토 결과(JSON) 다운로드",
-                        data=json.dumps(payload, ensure_ascii=False, indent=2),
-                        file_name="guideline_check_result.json",
-                        mime="application/json",
-                    )
+        if llm_help_on and api_key and ref.get("filled_ratio"):
+            if st.button("필수로 보는 이유 한 줄 설명(LLM)"):
+                with st.spinner("LLM이 요약 설명 작성 중..."):
+                    msg = llm_explain_required(api_key, model_text, ref["filled_ratio"], topk=5)
+                if msg:
+                    st.markdown("**📝 왜 필수로 보나요? (LLM 요약)**")
+                    st.write(msg)
