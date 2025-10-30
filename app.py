@@ -3,7 +3,6 @@ import os
 import io
 import base64
 import json
-import hashlib
 from typing import List, Dict, Any
 from PIL import Image
 from openai import OpenAI
@@ -57,6 +56,7 @@ def save_guideline_to_chroma(chunks: List[str], embeddings: List[List[float]]):
         st.error("가이드라인 PDF에서 텍스트를 못 뽑았어요.")
         return
     col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
+    # source 기준으로만 삭제
     col.delete(where={"source": "guideline"})
     ids = [f"guide_{i}" for i in range(len(chunks))]
     metas = [{"source": "guideline", "chunk": i} for i in range(len(chunks))]
@@ -85,7 +85,12 @@ def search_guideline(query: str, api_key: str, k: int = 4) -> List[Dict[str, Any
     result = col.query(query_embeddings=[q_emb], n_results=k)
     docs = []
     for i in range(len(result["documents"][0])):
-        docs.append({"text": result["documents"][0][i], "metadata": result["metadatas"][0][i]})
+        docs.append(
+            {
+                "text": result["documents"][0][i],
+                "metadata": result["metadatas"][0][i],
+            }
+        )
     return docs
 
 
@@ -98,7 +103,8 @@ def pil_to_b64(img: Image.Image) -> str:
 
 def gpt_extract_table(api_key: str, img: Image.Image, model: str = "gpt-4o") -> Dict[str, Any]:
     """
-    - 표 안 '제목' 우선, 없으면 상단 큰 제목
+    - 표 안 '제목' 우선
+    - 없으면 상단 큰 제목
     - 결재선 무시
     - 첨부/증빙 관련 수치는 attachment_count
     """
@@ -111,12 +117,13 @@ def gpt_extract_table(api_key: str, img: Image.Image, model: str = "gpt-4o") -> 
     )
     user_msg = (
         "아래 규칙으로 JSON을 만들어라.\n"
-        "1) 표에 '제목' 셀/열이 있으면 그 값을 JSON의 '제목'으로.\n"
-        "2) 없으면 상단 큰 제목을 '제목'으로.\n"
-        "3) 결재/합의/승인/참조/수신 박스는 무시하거나 'approval_line_ignored': true만.\n"
-        "4) '첨부','첨부 개수','증빙 개수','영수증 건수' 등은 숫자만 모아 'attachment_count'에.\n"
-        "5) 나머지 표 셀도 key-value로 최대한 포함.\n"
-        "6) JSON만 반환."
+        "1. 표(테이블) 안에 '제목'이라는 셀/행/열이 있으면 그 값을 JSON의 '제목'으로 넣어. (1순위)\n"
+        "2. 표 안에 '제목'이 없으면 문서 상단의 큰 제목을 '제목'으로 넣어.\n"
+        "3. 결재/합의/승인/참조/수신/기안자 이름이 있는 박스는 무시하거나 'approval_line_ignored': true 로만 넣어.\n"
+        "4. '첨부', '첨부파일', '첨부 개수', '증빙 개수', '영수증 건수'처럼 보이는 칸이 있으면 그 칸의 숫자를 모아서 "
+        "JSON의 'attachment_count' 키에 넣어. 숫자가 안 보이면 0으로 넣어.\n"
+        "5. 다른 표 셀(회사, 사용부서, 사용자, 지급처, 업무추진비, 결의금액, 지급요청일 등)은 가능한 한 key-value로 넣어.\n"
+        "6. JSON만 반환해."
     )
 
     resp = client.chat.completions.create(
@@ -147,6 +154,7 @@ def gpt_extract_table(api_key: str, img: Image.Image, model: str = "gpt-4o") -> 
         data["제목"] = ""
     if "attachment_count" not in data:
         data["attachment_count"] = 0
+
     return data
 
 
@@ -157,14 +165,32 @@ def compare_doc_with_guideline(
     guideline_chunks: List[str],
     model: str = "gpt-4o",
 ) -> str:
-    llm = ChatOpenAI(model=model, temperature=0.0, api_key=api_key, max_tokens=2200)
+    """
+    - 가져온 가이드라인 전부 보고
+    - 제목 누락
+    - 첨부파일 미첨부
+    - 기타 가이드/유의사항 위반
+    을 전부 나열
+    """
+    clean_doc_json = {k: v for k, v in doc_json.items() if k != "approval_line_ignored"}
 
+    # ❗ 여기서 max_tokens를 크게 줘서 중간에 안 잘리게 한다
+    llm = ChatOpenAI(
+        model=model,
+        temperature=0.0,
+        api_key=api_key,
+        max_tokens=2200,   # 필요하면 더 늘려도 됨
+    )
+
+    # 너무 많이 넣으면 자꾸 잘려서 상위 12개만
     MAX_GUIDE = 12
     guideline_text = "\n\n".join(guideline_chunks[:MAX_GUIDE])
     user_doc_text = json.dumps(doc_json, ensure_ascii=False, indent=2)
 
     prompt = f"""
 너는 회사 결재/경비 서류를 사전 검토하는 AI다.
+
+아래는 회사에서 제공한 가이드라인/유의사항 일부다. 중요한 부분만 골라서 쓰면 된다.
 
 [회사 가이드라인 및 유의사항 일부 (최대 {MAX_GUIDE}개)]
 {guideline_text}
@@ -173,13 +199,13 @@ def compare_doc_with_guideline(
 {user_doc_text}
 
 요구사항:
-1. 발견할 수 있는 모든 위반·누락·형식오류를 전부 나열해라.
-2. 특히 다음은 반드시 체크:
-   - '제목'이 비어 있거나 불완전한지
-   - attachment_count가 0인데 문서 내용에 '출장','법인카드','개인카드','경비','지급요청','증빙','영수증' 등이 있는지
-   - 필수 필드(지급요청일, 증빙유형, 카드내역 등)가 비어있는지
+1. 발견할 수 있는 **모든** 위반·누락·형식오류를 전부 나열해라. 하나만 쓰고 끝내지 마라.
+2. 특히 다음은 반드시 체크해라:
+   - 표 안의 '제목'이 비어 있거나 불완전한지
+   - attachment_count가 0인데 문서 내용에 '출장', '법인카드', '개인카드', '경비', '지급요청', '증빙', '영수증' 등이 있는지
+   - 가이드라인에서 필수라고 한 필드(예: 지급요청일, 증빙유형, 카드내역 등)가 JSON에서 비어 있는지
 3. 결재선(결재/합의/승인/참조/수신)은 문제로 삼지 마라.
-4. 출력 형식:
+4. 출력 형식은 아래 형식으로만 써라. 여러 개면 여러 개를 이어서 써라.
 
 - 항목명: ...
 - 문제점: ...
@@ -188,12 +214,17 @@ def compare_doc_with_guideline(
 - 항목명: ...
 - 문제점: ...
 - 수정 예시: ...
+
+'가이드라인 근거:', '출처:' 같은 문장은 쓰지 마라.
 """
     res = llm.invoke(prompt)
     return res.content if hasattr(res, "content") else str(res)
 
 
-# ============================ UI ============================
+
+# ------------------------------------------------------------------------------
+# 8. Streamlit UI 구성
+# ------------------------------------------------------------------------------
 with st.sidebar:
     st.subheader("🔑 OpenAI 설정")
     api_key = st.text_input(
@@ -203,6 +234,12 @@ with st.sidebar:
     )
     model = st.selectbox("GPT Vision / LLM 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
 
+col1, col2 = st.columns([1.1, 0.9])
+
+
+# ------------------------------------------------------------------------------
+# 본문 레이아웃
+# ------------------------------------------------------------------------------
 col1, col2 = st.columns([1.1, 0.9])
 
 # ------------ 왼쪽: 업로드 ------------
@@ -233,29 +270,20 @@ with col1:
 
     st.subheader("③ 결재/경비 서류 이미지 업로드")
     img_file = st.file_uploader("이미지 (jpg/png)", type=["jpg", "jpeg", "png"], key="doc_img")
-
-    # 업로드 시 자동 인식
     if img_file is not None:
-        img_bytes = img_file.getvalue()
-        img_hash = hashlib.md5(img_bytes).hexdigest()
+        doc_img = Image.open(img_file)
+        st.image(doc_img, caption="업로드한 결재 문서", use_container_width=True)
 
-        st.image(Image.open(io.BytesIO(img_bytes)), caption="업로드한 결재 문서", use_container_width=True)
-
-        need_run = st.session_state.get("last_img_hash") != img_hash or "doc_json" not in st.session_state
-
-        if not api_key:
-            st.warning("API Key가 필요합니다. 사이드바에 입력해 주세요.")
-        elif need_run:
-            with st.spinner("GPT가 문서 인식 중..."):
-                doc_img = Image.open(io.BytesIO(img_bytes))
-                doc_json = gpt_extract_table(api_key, doc_img, model=model)
-            st.session_state["doc_json"] = doc_json
-            st.session_state["last_img_hash"] = img_hash
-            st.success("문서 인식 완료 ✅")
-
-        if "doc_json" in st.session_state:
-            st.code(json.dumps(st.session_state["doc_json"], ensure_ascii=False, indent=2), language="json")
-            st.info(f"📎 인식된 첨부파일 개수: {st.session_state['doc_json'].get('attachment_count', 0)}")
+        if st.button("이미지에서 표/제목/첨부 인식", type="primary"):
+            if not api_key:
+                st.error("API Key가 필요합니다.")
+            else:
+                with st.spinner("GPT가 문서 인식 중..."):
+                    doc_json = gpt_extract_table(api_key, doc_img, model=model)
+                st.session_state["doc_json"] = doc_json
+                st.success("문서 인식 완료 ✅")
+                #st.code(json.dumps(doc_json, ensure_ascii=False, indent=2), language="json")
+                #st.info(f"📎 인식된 첨부파일 개수: {doc_json.get('attachment_count', 0)}")
 
 # ------------ 오른쪽: 비교 ------------
 with col2:
@@ -264,10 +292,12 @@ with col2:
         if not api_key:
             st.error("API Key가 필요합니다.")
         else:
+            # 결재 서류가 있는지 확인
             doc_json = st.session_state.get("doc_json")
             if not doc_json:
                 st.error("먼저 결재 서류 이미지를 올리고 인식하세요.")
             else:
+                # RAG: 필요한 쿼리들
                 guide_qs = [
                     "출장비용지급품의 작성 시 필수 항목은 무엇인가",
                     "지급요청일 입력 규칙은 무엇인가",
@@ -283,28 +313,35 @@ with col2:
                 ]
 
                 retrieved_texts: List[str] = []
+
                 for q in guide_qs:
                     for r in search_guideline(q, api_key, k=3):
                         if r["metadata"].get("source") == "guideline":
                             retrieved_texts.append(r["text"])
+
                 for q in caution_qs:
                     for r in search_guideline(q, api_key, k=3):
                         if r["metadata"].get("source") == "caution":
                             retrieved_texts.append(r["text"])
+
                 for q in attach_qs:
                     for r in search_guideline(q, api_key, k=2):
+                        # 첨부 규칙은 가이드/유의사항 어느 쪽이든 다 가져옴
                         retrieved_texts.append(r["text"])
 
                 if not retrieved_texts:
                     st.error("가이드라인/유의사항이 없습니다. 먼저 PDF를 임베딩하세요.")
                 else:
                     with st.spinner("가이드라인과 비교 중... (모든 위반사항을 찾는 중)"):
-                        answer = compare_doc_with_guideline(api_key, doc_json, retrieved_texts, model=model)
+                        answer = compare_doc_with_guideline(
+                            api_key, doc_json, retrieved_texts, model=model
+                        )
 
                     st.success("검토 완료 ✅")
                     st.markdown("**검토 결과**")
                     st.write(answer)
 
+                    # 결과 다운로드
                     payload = {
                         "doc_json": doc_json,
                         "retrieved_guideline_texts": retrieved_texts,
