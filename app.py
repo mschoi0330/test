@@ -4,12 +4,15 @@ import io
 import base64
 import json
 import hashlib
+import re
 from typing import List, Dict, Any
-from PIL import Image
+
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 from openai import OpenAI
 from pypdf import PdfReader
 import chromadb
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
 
 APP_TITLE = "📄 AI 결재 사전검토"
 
@@ -57,7 +60,6 @@ def save_guideline_to_chroma(chunks: List[str], embeddings: List[List[float]]):
         st.error("가이드라인 PDF에서 텍스트를 못 뽑았어요.")
         return
     col = chroma_client.get_or_create_collection(GUIDE_COLLECTION_NAME)
-    # source 기준으로만 삭제
     col.delete(where={"source": "guideline"})
     ids = [f"guide_{i}" for i in range(len(chunks))]
     metas = [{"source": "guideline", "chunk": i} for i in range(len(chunks))]
@@ -86,48 +88,124 @@ def search_guideline(query: str, api_key: str, k: int = 4) -> List[Dict[str, Any
     result = col.query(query_embeddings=[q_emb], n_results=k)
     docs = []
     for i in range(len(result["documents"][0])):
-        docs.append(
-            {
-                "text": result["documents"][0][i],
-                "metadata": result["metadatas"][0][i],
-            }
-        )
+        docs.append({"text": result["documents"][0][i], "metadata": result["metadatas"][0][i]})
     return docs
 
 
-# -------------------- Vision: 이미지 → JSON --------------------
+# -------------------- Vision 유틸 --------------------
 def pil_to_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def gpt_extract_table(api_key: str, img: Image.Image, model: str = "gpt-4o") -> Dict[str, Any]:
-    """
-    - 표 안 '제목' 우선
-    - 없으면 상단 큰 제목
-    - 결재선 무시
-    - 첨부/증빙 관련 수치는 attachment_count
-    """
+# ===== 인식 품질 개선: 전처리 + 스키마 고정 + 2패스 재시도 =====
+def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
+    img = pil.convert("L")  # grayscale
+    w, h = img.size
+    scale = 1600 / max(w, h)
+    if scale > 1.05:
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    img = ImageEnhance.Contrast(img).enhance(1.25)
+    img = ImageEnhance.Sharpness(img).enhance(1.4)
+    img = ImageOps.autocontrast(img)
+    img = img.point(lambda p: 255 if p > 190 else (0 if p < 120 else p))
+    return img.convert("RGB")
+
+
+FIELD_SCHEMA = {
+    "제목": {"required": True, "pattern": r".{2,}"},
+    "attachment_count": {"required": True, "pattern": r"^\d+$"},
+    "회사": {"required": True, "pattern": r".{2,}"},
+    "사용부서(팀)": {"required": True, "pattern": r".{1,}"},
+    "사용자": {"required": True, "pattern": r".{1,}"},
+    "지급처": {"required": False, "pattern": r".*"},
+    "업무추진비": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},
+    "결의금액": {"required": False, "pattern": r"^\d{1,3}(,\d{3})*$"},
+    "지급요청일": {"required": False, "pattern": r"^\d{4}-\d{2}-\d{2}(\([^)]+\))?$"},
+}
+
+KEY_NORMALIZER = {
+    "사용부서": "사용부서(팀)",
+    "부서": "사용부서(팀)",
+    "제 목": "제목",
+    "제목 ": "제목",
+    "합계": "결의금액",
+    "총합계": "결의금액",
+}
+
+
+def _normalize_keys(d: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    for k, v in d.items():
+        k2 = KEY_NORMALIZER.get(k.strip(), k.strip())
+        out[k2] = v
+    return out
+
+
+def _normalize_values(d: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(d)
+
+    def norm_money(s):
+        s = str(s).strip()
+        s = re.sub(r"[^\d,]", "", s)  # "150,000원" -> "150,000"
+        if s.isdigit():
+            s = f"{int(s):,}"
+        return s
+
+    if "업무추진비" in out:
+        out["업무추진비"] = norm_money(out["업무추진비"])
+    if "결의금액" in out:
+        out["결의금액"] = norm_money(out["결의금액"])
+
+    if "지급요청일" in out:
+        s = str(out["지급요청일"])
+        s2 = re.sub(r"[./]", "-", s)  # 2025.11.06 → 2025-11-06
+        m = re.search(r"(\d{4}-\d{2}-\d{2})(\([^)]+\))?", s2)
+        if m:
+            out["지급요청일"] = m.group(0)
+
+    if "attachment_count" in out:
+        m = re.search(r"\d+", str(out["attachment_count"]))
+        out["attachment_count"] = int(m.group()) if m else 0
+
+    return out
+
+
+def _validate_schema(d: Dict[str, Any]) -> Dict[str, Any]:
+    notes = []
+    for k, rule in FIELD_SCHEMA.items():
+        if rule["required"] and (k not in d or str(d[k]).strip() == ""):
+            notes.append(f"필수값 누락: {k}")
+        if k in d and rule.get("pattern"):
+            if not re.fullmatch(rule["pattern"], str(d[k])):
+                notes.append(f"형식 불일치: {k}={d[k]}")
+    d["_notes"] = notes
+    return d
+
+
+def _ask_vision(api_key: str, pil_img: Image.Image, model: str, strict_json=True) -> Dict[str, Any]:
     client = OpenAI(api_key=api_key)
-    img_b64 = pil_to_b64(img)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
     system_msg = (
-        "너는 회사 결재/경비 문서를 표로 읽어 JSON으로 만드는 AI다. "
-        "표 안 제목은 반드시 '제목'으로 넣고, 결재선은 무시하고, 첨부 개수는 'attachment_count'로 넣어라."
+        "너는 회사 결재/경비 문서 이미지를 읽어 정해진 JSON 스키마로만 반환하는 AI다. 설명 없이 JSON만 출력한다."
     )
     user_msg = (
-        "아래 규칙으로 JSON을 만들어라.\n"
-        "1. 표(테이블) 안에 '제목'이라는 셀/행/열이 있으면 그 값을 JSON의 '제목'으로 넣어. (1순위)\n"
-        "2. 표 안에 '제목'이 없으면 문서 상단의 큰 제목을 '제목'으로 넣어.\n"
-        "3. 결재/합의/승인/참조/수신/기안자 이름이 있는 박스는 무시하거나 'approval_line_ignored': true 로만 넣어.\n"
-        "4. '첨부', '첨부파일', '첨부 개수', '증빙 개수', '영수증 건수'처럼 보이는 칸이 있으면 그 칸의 숫자를 모아서 "
-        "JSON의 'attachment_count' 키에 넣어. 숫자가 안 보이면 0으로 넣어.\n"
-        "5. 다른 표 셀(회사, 사용부서, 사용자, 지급처, 업무추진비, 결의금액, 지급요청일 등)은 가능한 한 key-value로 넣어.\n"
-        "6. JSON만 반환해."
+        "다음 키만 포함하는 JSON을 반환해. 키는 정확히 아래와 일치해야 한다.\n"
+        + list(FIELD_SCHEMA.keys()).__str__()
+        + "\n규칙:\n"
+        "1) 표에 '제목' 셀이 있으면 그 값을 '제목'에. 없으면 상단 큰 제목을 사용.\n"
+        "2) 결재/합의/승인/참조/수신 영역은 무시. 필요 시 'approval_line_ignored': true를 추가 가능.\n"
+        "3) 'attachment_count'는 숫자만. 해당 칸이 없으면 0.\n"
+        "4) '업무추진비','결의금액'은 숫자와 콤마만(예: 150,000).\n"
+        "5) '지급요청일'은 YYYY-MM-DD 또는 YYYY-MM-DD(요일) 형식.\n"
+        "6) JSON만 출력해."
     )
 
-    resp = client.chat.completions.create(
+    kwargs = dict(
         model=model,
         temperature=0,
         messages=[
@@ -136,27 +214,65 @@ def gpt_extract_table(api_key: str, img: Image.Image, model: str = "gpt-4o") -> 
                 "role": "user",
                 "content": [
                     {"type": "text", "text": user_msg},
-                    {"type": "image_url", "image_url": {"url": img_b64}},
+                    {"type": "image_url", "image_url": {"url": b64}},
                 ],
             },
         ],
     )
+    if strict_json:
+        kwargs["response_format"] = {"type": "json_object"}
 
+    resp = client.chat.completions.create(**kwargs)
     content = resp.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = content.strip("`").replace("json", "", 1).strip()
-
     try:
-        data = json.loads(content)
+        return json.loads(content)
     except Exception:
-        data = {"_raw": content}
+        return {"_raw": content}
 
-    if "제목" not in data:
-        data["제목"] = ""
-    if "attachment_count" not in data:
-        data["attachment_count"] = 0
 
-    return data
+def gpt_extract_table(api_key: str, pil_img: Image.Image, model: str = "gpt-4o") -> Dict[str, Any]:
+    """
+    개선된 2-패스 추출:
+    - 이미지 전처리
+    - 강제 JSON + 스키마 고정
+    - mini ↔ 4o 교차 재시도 후 사후 보정/검증
+    """
+    img = preprocess_for_ocr(pil_img)
+
+    # 1차
+    data1 = _ask_vision(api_key, img, model=model, strict_json=True)
+    # 2차: 보조 모델 교차
+    alt_model = "gpt-4o-mini" if model == "gpt-4o" else "gpt-4o"
+    data2 = _ask_vision(api_key, img, model=alt_model, strict_json=True)
+
+    data1 = _normalize_values(_normalize_keys(data1))
+    data2 = _normalize_values(_normalize_keys(data2))
+
+    merged = {}
+    for k in FIELD_SCHEMA.keys():
+        v1, v2 = data1.get(k), data2.get(k)
+        if v1 == v2:
+            merged[k] = v1
+        else:
+            pat = FIELD_SCHEMA[k].get("pattern")
+            def ok(v): return bool(re.fullmatch(pat, str(v))) if pat and v is not None else False
+            merged[k] = v1 if ok(v1) else (v2 if ok(v2) else (v1 or v2 or ""))
+
+    merged = _validate_schema(merged)
+
+    # 제목/첨부 누락 시 마지막 방어 재시도
+    need_reask = False
+    if (not merged.get("제목")) or (merged.get("attachment_count", 0) == 0):
+        data3 = _ask_vision(api_key, img, model=model, strict_json=True)
+        data3 = _normalize_values(_normalize_keys(data3))
+        for k in ["제목", "attachment_count"]:
+            if (not merged.get(k)) and data3.get(k):
+                merged[k] = data3.get(k)
+                need_reask = True
+    if need_reask:
+        merged = _validate_schema(merged)
+
+    return merged
 
 
 # -------------------- LLM 비교 (전체 출력 버전) --------------------
@@ -166,32 +282,14 @@ def compare_doc_with_guideline(
     guideline_chunks: List[str],
     model: str = "gpt-4o",
 ) -> str:
-    """
-    - 가져온 가이드라인 전부 보고
-    - 제목 누락
-    - 첨부파일 미첨부
-    - 기타 가이드/유의사항 위반
-    을 전부 나열
-    """
-    clean_doc_json = {k: v for k, v in doc_json.items() if k != "approval_line_ignored"}
+    llm = ChatOpenAI(model=model, temperature=0.0, api_key=api_key, max_tokens=2200)
 
-    # ❗ 여기서 max_tokens를 크게 줘서 중간에 안 잘리게 한다
-    llm = ChatOpenAI(
-        model=model,
-        temperature=0.0,
-        api_key=api_key,
-        max_tokens=2200,   # 필요하면 더 늘려도 됨
-    )
-
-    # 너무 많이 넣으면 자꾸 잘려서 상위 12개만
     MAX_GUIDE = 12
     guideline_text = "\n\n".join(guideline_chunks[:MAX_GUIDE])
     user_doc_text = json.dumps(doc_json, ensure_ascii=False, indent=2)
 
     prompt = f"""
 너는 회사 결재/경비 서류를 사전 검토하는 AI다.
-
-아래는 회사에서 제공한 가이드라인/유의사항 일부다. 중요한 부분만 골라서 쓰면 된다.
 
 [회사 가이드라인 및 유의사항 일부 (최대 {MAX_GUIDE}개)]
 {guideline_text}
@@ -200,13 +298,13 @@ def compare_doc_with_guideline(
 {user_doc_text}
 
 요구사항:
-1. 발견할 수 있는 **모든** 위반·누락·형식오류를 전부 나열해라. 하나만 쓰고 끝내지 마라.
-2. 특히 다음은 반드시 체크해라:
-   - 표 안의 '제목'이 비어 있거나 불완전한지
-   - attachment_count가 0인데 문서 내용에 '출장', '법인카드', '개인카드', '경비', '지급요청', '증빙', '영수증' 등이 있는지
-   - 가이드라인에서 필수라고 한 필드(예: 지급요청일, 증빙유형, 카드내역 등)가 JSON에서 비어 있는지
+1. 발견할 수 있는 모든 위반·누락·형식오류를 전부 나열해라.
+2. 특히 다음은 반드시 체크:
+   - '제목'이 비어 있거나 불완전한지
+   - attachment_count가 0인데 문서 내용에 '출장','법인카드','개인카드','경비','지급요청','증빙','영수증' 등이 있는지
+   - 필수 필드(지급요청일, 증빙유형, 카드내역 등)가 비어있는지
 3. 결재선(결재/합의/승인/참조/수신)은 문제로 삼지 마라.
-4. 출력 형식은 아래 형식으로만 써라. 여러 개면 여러 개를 이어서 써라.
+4. 출력 형식:
 
 - 항목명: ...
 - 문제점: ...
@@ -215,17 +313,12 @@ def compare_doc_with_guideline(
 - 항목명: ...
 - 문제점: ...
 - 수정 예시: ...
-
-'가이드라인 근거:', '출처:' 같은 문장은 쓰지 마라.
 """
     res = llm.invoke(prompt)
     return res.content if hasattr(res, "content") else str(res)
 
 
-
-# ------------------------------------------------------------------------------
-# 8. Streamlit UI 구성
-# ------------------------------------------------------------------------------
+# ============================ UI ============================
 with st.sidebar:
     st.subheader("🔑 OpenAI 설정")
     api_key = st.text_input(
@@ -235,12 +328,6 @@ with st.sidebar:
     )
     model = st.selectbox("GPT Vision / LLM 모델", ["gpt-4o-mini", "gpt-4o"], index=0)
 
-col1, col2 = st.columns([1.1, 0.9])
-
-
-# ------------------------------------------------------------------------------
-# 본문 레이아웃
-# ------------------------------------------------------------------------------
 col1, col2 = st.columns([1.1, 0.9])
 
 # ------------ 왼쪽: 업로드 ------------
@@ -272,30 +359,29 @@ with col1:
     st.subheader("③ 결재/경비 서류 이미지 업로드")
     img_file = st.file_uploader("이미지 (jpg/png)", type=["jpg", "jpeg", "png"], key="doc_img")
 
-    # 업로드 파일이 바뀌면 자동 인식 (버튼 없이)
+    # 업로드 시 자동 인식
     if img_file is not None:
         img_bytes = img_file.getvalue()
         img_hash = hashlib.md5(img_bytes).hexdigest()
 
-        # 미리보기
         st.image(Image.open(io.BytesIO(img_bytes)), caption="업로드한 결재 문서", use_container_width=True)
 
-        # 파일이 새로 올라왔거나 다른 파일이면 자동 인식
         need_run = st.session_state.get("last_img_hash") != img_hash or "doc_json" not in st.session_state
 
         if not api_key:
             st.warning("API Key가 필요합니다. 사이드바에 입력해 주세요.")
         elif need_run:
             with st.spinner("GPT가 문서 인식 중..."):
-                doc_img = Image.open(io.BytesIO(img_bytes))
+                doc_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 doc_json = gpt_extract_table(api_key, doc_img, model=model)
             st.session_state["doc_json"] = doc_json
             st.session_state["last_img_hash"] = img_hash
             st.success("문서 인식 완료 ✅")
 
-        # 인식 결과 표시
+        # 결과 JSON은 표시하지 않음 (요청 사항)
         if "doc_json" in st.session_state:
-            pass
+            pass  # 화면 출력 생략
+
 # ------------ 오른쪽: 비교 ------------
 with col2:
     st.subheader("④ 가이드라인 + 유의사항과 비교")
@@ -303,12 +389,10 @@ with col2:
         if not api_key:
             st.error("API Key가 필요합니다.")
         else:
-            # 결재 서류가 있는지 확인
             doc_json = st.session_state.get("doc_json")
             if not doc_json:
                 st.error("먼저 결재 서류 이미지를 올리고 인식하세요.")
             else:
-                # RAG: 필요한 쿼리들
                 guide_qs = [
                     "출장비용지급품의 작성 시 필수 항목은 무엇인가",
                     "지급요청일 입력 규칙은 무엇인가",
@@ -324,35 +408,28 @@ with col2:
                 ]
 
                 retrieved_texts: List[str] = []
-
                 for q in guide_qs:
                     for r in search_guideline(q, api_key, k=3):
                         if r["metadata"].get("source") == "guideline":
                             retrieved_texts.append(r["text"])
-
                 for q in caution_qs:
                     for r in search_guideline(q, api_key, k=3):
                         if r["metadata"].get("source") == "caution":
                             retrieved_texts.append(r["text"])
-
                 for q in attach_qs:
                     for r in search_guideline(q, api_key, k=2):
-                        # 첨부 규칙은 가이드/유의사항 어느 쪽이든 다 가져옴
                         retrieved_texts.append(r["text"])
 
                 if not retrieved_texts:
                     st.error("가이드라인/유의사항이 없습니다. 먼저 PDF를 임베딩하세요.")
                 else:
                     with st.spinner("가이드라인과 비교 중... (모든 위반사항을 찾는 중)"):
-                        answer = compare_doc_with_guideline(
-                            api_key, doc_json, retrieved_texts, model=model
-                        )
+                        answer = compare_doc_with_guideline(api_key, doc_json, retrieved_texts, model=model)
 
                     st.success("검토 완료 ✅")
                     st.markdown("**검토 결과**")
                     st.write(answer)
 
-                    # 결과 다운로드
                     payload = {
                         "doc_json": doc_json,
                         "retrieved_guideline_texts": retrieved_texts,
